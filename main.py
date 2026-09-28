@@ -1,13 +1,15 @@
 """
 ============================================================
-   GHOST AUTO-REACTOR v3.0
+   GHOST AUTO-REACTOR v4.0
    Whitelist-Based Multi-Channel Auto-Reaction Bot
    Real Sessions Only • Auto-Join • Per-User Config
    + Auto-Cleanup Expired Sessions
    + @username Support
    + Full Order Notifications
-   + Owner as User (can add own channels)
-   + Quick Reaction (post link se reactions)
+   + Owner as User
+   + Quick Reaction (post link)
+   + Smart Emoji Fallback (invalid emoji → try another from pool)
+   + Session Retry (failed session → next session until count done)
    Credit: @Anonymous_User_37
 ============================================================
 """
@@ -122,24 +124,18 @@ LANGUAGES = {
 admin_client = None
 bot = TelegramClient("ghost_auto_bot", API_ID, API_HASH)
 
-# Real session clients
 REAL_CLIENTS = {}
 REAL_CLIENT_LOCK = asyncio.Lock()
-REAL_FLOOD_UNTIL = {}         # {session_file: datetime}
+REAL_FLOOD_UNTIL = {}
 
-# Task state
 TASK_RUNNING = False
 TASK_USER_ID = None
 
-# Caches
 ENTITY_CACHE = {}
 ENTITY_CACHE_TTL = 3600
 _LAST_EDIT_TIME = {}
 
-# User states for input flows
 USER_STATES = {}
-
-# Failed tracker (per user+channel)
 FAILED_TRACKER = {}
 
 _start_time = time.time()
@@ -162,7 +158,6 @@ def progress_bar(cur, total, width=12):
 
 
 def DBG(msg, level="info"):
-    """Debug logger — always prints"""
     ts = datetime.now().strftime("%H:%M:%S")
     ic = {
         "info": "🔍", "ok": "✅", "fail": "❌", "warn": "⚠️",
@@ -184,7 +179,6 @@ def D_err(e, ctx=""):
 
 
 def sanitize_title(title, limit=60):
-    """Sanitize chat title for safe storage"""
     if not title:
         return "Unknown"
     t = str(title).replace("\n", " ").replace("\r", " ").replace("\t", " ")
@@ -235,7 +229,6 @@ def OWNER_IS(uid):
 
 # ══════════════════════ SESSION HELPERS ══════════════════════
 def discover_sessions():
-    """Find all .session files"""
     if not os.path.isdir(SESSIONS_DIR):
         return []
     try:
@@ -282,17 +275,14 @@ def get_sessions_status():
 
 # ══════════════════════ DATABASE INIT ══════════════════════
 def db_init():
-    """Initialize database with all tables"""
     if "/" in DB_FILE:
         os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
 
-    # ── Config ──
     c.execute("""CREATE TABLE IF NOT EXISTS config (
         key TEXT PRIMARY KEY, value TEXT)""")
 
-    # ── Users (Whitelist) ──
     c.execute("""CREATE TABLE IF NOT EXISTS users (
         user_id INTEGER PRIMARY KEY,
         username TEXT,
@@ -305,7 +295,6 @@ def db_init():
         total_reactions INTEGER DEFAULT 0,
         notes TEXT)""")
 
-    # ── User Channels (per-user, per-channel config) ──
     c.execute("""CREATE TABLE IF NOT EXISTS user_channels (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER NOT NULL,
@@ -324,7 +313,6 @@ def db_init():
         created_at TEXT DEFAULT CURRENT_TIMESTAMP,
         UNIQUE(user_id, chat_id))""")
 
-    # ── Reaction log ──
     c.execute("""CREATE TABLE IF NOT EXISTS auto_reactions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER,
@@ -335,7 +323,6 @@ def db_init():
         status TEXT,
         created_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
 
-    # ── Sessions log ──
     c.execute("""CREATE TABLE IF NOT EXISTS sessions_log (
         filename TEXT PRIMARY KEY,
         is_flooded INTEGER DEFAULT 0,
@@ -344,7 +331,6 @@ def db_init():
         total_used INTEGER DEFAULT 0,
         added_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
 
-    # ── Notifications ──
     c.execute("""CREATE TABLE IF NOT EXISTS notifications (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER,
@@ -352,7 +338,6 @@ def db_init():
         is_read INTEGER DEFAULT 0,
         created_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
 
-    # ── SQLite optimizations ──
     try:
         c.execute("PRAGMA journal_mode=WAL")
         c.execute("PRAGMA synchronous=NORMAL")
@@ -361,7 +346,6 @@ def db_init():
     except Exception:
         pass
 
-    # ── Indices ──
     indices = [
         "CREATE INDEX IF NOT EXISTS idx_channels_user ON user_channels(user_id)",
         "CREATE INDEX IF NOT EXISTS idx_channels_active ON user_channels(is_active)",
@@ -375,7 +359,6 @@ def db_init():
         except Exception:
             pass
 
-    # ── Config defaults ──
     defaults = [
         ("owner_username", OWNER_USERNAME_DEFAULT),
         ("owner_id", str(OWNER_ID_DEFAULT)),
@@ -390,7 +373,6 @@ def db_init():
     DBG("Database initialized", "db")
 
 
-# ══════════════════════ CONFIG FUNCTIONS ══════════════════════
 def cfg_bool(k, d=True):
     return cfg_get(k, "1" if d else "0") == "1"
 
@@ -403,7 +385,6 @@ def cfg_toggle(k):
 
 # ══════════════════════ WHITELIST — USERS ══════════════════════
 def db_add_user(user_id, username=None, first_name=None, added_by=None):
-    """Add user to whitelist"""
     conn = sqlite3.connect(DB_FILE)
     try:
         c = conn.cursor()
@@ -427,14 +408,12 @@ def db_add_user(user_id, username=None, first_name=None, added_by=None):
 
 
 def db_remove_user(user_id):
-    """Remove user + channels"""
     conn = sqlite3.connect(DB_FILE)
     try:
         c = conn.cursor()
         c.execute("DELETE FROM users WHERE user_id=?", (user_id,))
         c.execute("DELETE FROM user_channels WHERE user_id=?", (user_id,))
         c.execute("DELETE FROM auto_reactions WHERE user_id=?", (user_id,))
-        n = c.rowcount
         conn.commit()
         return True
     finally:
@@ -442,7 +421,6 @@ def db_remove_user(user_id):
 
 
 def db_get_user(user_id):
-    """Get user whitelist status"""
     conn = sqlite3.connect(DB_FILE)
     try:
         return conn.execute("""SELECT user_id, username, first_name,
@@ -454,7 +432,6 @@ def db_get_user(user_id):
 
 
 def db_is_whitelisted(user_id):
-    """Check if user is whitelisted + active"""
     conn = sqlite3.connect(DB_FILE)
     try:
         r = conn.execute("""SELECT is_active FROM users WHERE user_id=?""",
@@ -553,7 +530,6 @@ def db_set_user_notes(user_id, notes):
 
 
 def db_find_user_by_username(username):
-    """Find user by @username"""
     if not username:
         return None
     username = username.lstrip("@")
@@ -570,7 +546,6 @@ def db_find_user_by_username(username):
 def db_add_channel(user_id, chat_link, chat_title=None,
                    chat_id=None, reaction_count=5,
                    emoji_mode="default", custom_emojis=None):
-    """Add channel to user's list"""
     conn = sqlite3.connect(DB_FILE)
     try:
         c = conn.cursor()
@@ -700,7 +675,6 @@ def db_count_active_channels(user_id=None):
 
 
 def db_update_channel_last_post(channel_id, post_id, reactions_sent=0):
-    """Update last post + increment counts"""
     conn = sqlite3.connect(DB_FILE)
     try:
         c = conn.cursor()
@@ -720,7 +694,6 @@ def db_update_channel_last_post(channel_id, post_id, reactions_sent=0):
 
 
 def db_channel_already_exists(user_id, chat_id):
-    """Check if user already has this channel"""
     conn = sqlite3.connect(DB_FILE)
     try:
         r = conn.execute("""SELECT 1 FROM user_channels
@@ -868,7 +841,6 @@ def db_count_unread(user_id):
 
 # ══════════════════════ SESSIONS LOG ══════════════════════
 def db_log_session_use(filename, success=True):
-    """Log session usage"""
     try:
         conn = sqlite3.connect(DB_FILE)
         try:
@@ -909,262 +881,169 @@ print(f"[STARTUP] Sessions found: {len(discover_sessions())}", flush=True)
 # ══════════════════════ LANGUAGE STRINGS ══════════════════════
 LANG_STRINGS = {
     "en": {
-        "welcome": "Welcome back",
-        "denied": "Access Denied",
+        "welcome": "Welcome back", "denied": "Access Denied",
         "paid_bot": "This is a paid service",
-        "contact_owner": "Contact Owner",
-        "my_settings": "My Settings",
-        "my_channels": "My Channels",
-        "notifications": "Notifications",
-        "language": "Language",
-        "info": "Info",
-        "support": "Support",
-        "home": "Home",
-        "back": "Back",
-        "cancel": "Cancel",
-        "send": "Send",
-        "choose_language": "Choose Language",
+        "contact_owner": "Contact Owner", "my_settings": "My Settings",
+        "my_channels": "My Channels", "notifications": "Notifications",
+        "language": "Language", "info": "Info", "support": "Support",
+        "home": "Home", "back": "Back", "cancel": "Cancel",
+        "send": "Send", "choose_language": "Choose Language",
         "language_changed": "Language changed!",
         "no_channels": "No channels configured yet",
         "waiting_approval": "Waiting for owner approval",
-        "active": "Active",
-        "paused": "Paused",
+        "active": "Active", "paused": "Paused",
         "reactions_per_post": "reactions/post",
         "contact_for_changes": "Contact owner to change settings",
-        "added_on": "Added on",
-        "total_sent": "Total Sent",
-        "last_post": "Last Post",
-        "last_run": "Last Run",
-        "never": "Never",
-        "history": "History",
+        "added_on": "Added on", "total_sent": "Total Sent",
+        "last_post": "Last Post", "last_run": "Last Run",
+        "never": "Never", "history": "History",
         "no_history": "No history yet",
         "you_are_whitelisted": "You are whitelisted",
         "not_whitelisted": "You are not whitelisted",
-        "notif_on": "Notifications ON",
-        "notif_off": "Notifications OFF",
+        "notif_on": "Notifications ON", "notif_off": "Notifications OFF",
         "backup_owner": "Backup Owner",
     },
     "ur": {
-        "welcome": "خوش آمدید",
-        "denied": "رسائی مسترد",
+        "welcome": "خوش آمدید", "denied": "رسائی مسترد",
         "paid_bot": "یہ ایک پڈ سروس ہے",
-        "contact_owner": "اونر سے رابطہ",
-        "my_settings": "میری سیٹنگز",
-        "my_channels": "میرے چینلز",
-        "notifications": "اطلاعات",
-        "language": "زبان",
-        "info": "معلومات",
-        "support": "سپورٹ",
-        "home": "مین مینو",
-        "back": "واپس",
-        "cancel": "کینسل",
-        "send": "بھیجیں",
-        "choose_language": "زبان منتخب کریں",
+        "contact_owner": "اونر سے رابطہ", "my_settings": "میری سیٹنگز",
+        "my_channels": "میرے چینلز", "notifications": "اطلاعات",
+        "language": "زبان", "info": "معلومات", "support": "سپورٹ",
+        "home": "مین مینو", "back": "واپس", "cancel": "کینسل",
+        "send": "بھیجیں", "choose_language": "زبان منتخب کریں",
         "language_changed": "زبان تبدیل ہو گئی!",
         "no_channels": "ابھی کوئی چینل سیٹ نہیں ہوا",
         "waiting_approval": "اونر کی منظوری کا انتظار",
-        "active": "فعال",
-        "paused": "روکا ہوا",
+        "active": "فعال", "paused": "روکا ہوا",
         "reactions_per_post": "ری ایکشن فی پوسٹ",
         "contact_for_changes": "سیٹنگ بدلنے کے لیے اونر سے رابطہ کریں",
-        "added_on": "شامل کیا گیا",
-        "total_sent": "کل بھیجے",
-        "last_post": "آخری پوسٹ",
-        "last_run": "آخری بار",
-        "never": "کبھی نہیں",
-        "history": "ہسٹری",
+        "added_on": "شامل کیا گیا", "total_sent": "کل بھیجے",
+        "last_post": "آخری پوسٹ", "last_run": "آخری بار",
+        "never": "کبھی نہیں", "history": "ہسٹری",
         "no_history": "ابھی کوئی ہسٹری نہیں",
         "you_are_whitelisted": "آپ وائٹ لسٹ میں ہیں",
         "not_whitelisted": "آپ وائٹ لسٹ میں نہیں ہیں",
-        "notif_on": "اطلاعات آن",
-        "notif_off": "اطلاعات آف",
+        "notif_on": "اطلاعات آن", "notif_off": "اطلاعات آف",
         "backup_owner": "بیک اپ اونر",
     },
     "hi": {
-        "welcome": "वापसी पर स्वागत",
-        "denied": "पहुंच अस्वीकृत",
+        "welcome": "वापसी पर स्वागत", "denied": "पहुंच अस्वीकृत",
         "paid_bot": "यह एक पेड सेवा है",
-        "contact_owner": "मालिक से संपर्क",
-        "my_settings": "मेरी सेटिंग्स",
-        "my_channels": "मेरे चैनल",
-        "notifications": "सूचनाएं",
-        "language": "भाषा",
-        "info": "जानकारी",
-        "support": "सहायता",
-        "home": "मुख्य मेनू",
-        "back": "वापस",
-        "cancel": "रद्द",
-        "send": "भेजें",
-        "choose_language": "भाषा चुनें",
+        "contact_owner": "मालिक से संपर्क", "my_settings": "मेरी सेटिंग्स",
+        "my_channels": "मेरे चैनल", "notifications": "सूचनाएं",
+        "language": "भाषा", "info": "जानकारी", "support": "सहायता",
+        "home": "मुख्य मेनू", "back": "वापस", "cancel": "रद्द",
+        "send": "भेजें", "choose_language": "भाषा चुनें",
         "language_changed": "भाषा बदल गई!",
         "no_channels": "अभी कोई चैनल सेट नहीं है",
         "waiting_approval": "मालिक की मंजूरी का इंतज़ार",
-        "active": "सक्रिय",
-        "paused": "रुका हुआ",
+        "active": "सक्रिय", "paused": "रुका हुआ",
         "reactions_per_post": "रिएक्शन प्रति पोस्ट",
         "contact_for_changes": "सेटिंग बदलने के लिए मालिक से संपर्क करें",
-        "added_on": "जोड़ा गया",
-        "total_sent": "कुल भेजे",
-        "last_post": "आखिरी पोस्ट",
-        "last_run": "आखिरी बार",
-        "never": "कभी नहीं",
-        "history": "इतिहास",
+        "added_on": "जोड़ा गया", "total_sent": "कुल भेजे",
+        "last_post": "आखिरी पोस्ट", "last_run": "आखिरी बार",
+        "never": "कभी नहीं", "history": "इतिहास",
         "no_history": "अभी कोई इतिहास नहीं",
         "you_are_whitelisted": "आप व्हाइटलिस्ट में हैं",
         "not_whitelisted": "आप व्हाइटलिस्ट में नहीं हैं",
-        "notif_on": "सूचनाएं चालू",
-        "notif_off": "सूचनाएं बंद",
+        "notif_on": "सूचनाएं चालू", "notif_off": "सूचनाएं बंद",
         "backup_owner": "बैकअप मालिक",
     },
     "ar": {
-        "welcome": "مرحباً بعودتك",
-        "denied": "تم رفض الوصول",
-        "paid_bot": "هذه خدمة مدفوعة",
-        "contact_owner": "اتصل بالمالك",
-        "my_settings": "إعداداتي",
-        "my_channels": "قنواتي",
-        "notifications": "الإشعارات",
-        "language": "اللغة",
-        "info": "معلومات",
-        "support": "الدعم",
-        "home": "القائمة",
-        "back": "رجوع",
-        "cancel": "إلغاء",
-        "send": "إرسال",
-        "choose_language": "اختر اللغة",
-        "language_changed": "تم التغيير!",
+        "welcome": "مرحباً بعودتك", "denied": "تم رفض الوصول",
+        "paid_bot": "هذه خدمة مدفوعة", "contact_owner": "اتصل بالمالك",
+        "my_settings": "إعداداتي", "my_channels": "قنواتي",
+        "notifications": "الإشعارات", "language": "اللغة",
+        "info": "معلومات", "support": "الدعم", "home": "القائمة",
+        "back": "رجوع", "cancel": "إلغاء", "send": "إرسال",
+        "choose_language": "اختر اللغة", "language_changed": "تم التغيير!",
         "no_channels": "لا توجد قنوات بعد",
         "waiting_approval": "في انتظار موافقة المالك",
-        "active": "نشط",
-        "paused": "متوقف",
+        "active": "نشط", "paused": "متوقف",
         "reactions_per_post": "تفاعلات لكل منشور",
         "contact_for_changes": "اتصل بالمالك لتغيير الإعدادات",
-        "added_on": "أضيف في",
-        "total_sent": "إجمالي المرسل",
-        "last_post": "آخر منشور",
-        "last_run": "آخر تشغيل",
-        "never": "أبداً",
-        "history": "السجل",
+        "added_on": "أضيف في", "total_sent": "إجمالي المرسل",
+        "last_post": "آخر منشور", "last_run": "آخر تشغيل",
+        "never": "أبداً", "history": "السجل",
         "no_history": "لا يوجد سجل بعد",
         "you_are_whitelisted": "أنت في القائمة",
         "not_whitelisted": "أنت لست في القائمة",
-        "notif_on": "الإشعارات مفعلة",
-        "notif_off": "الإشعارات معطلة",
+        "notif_on": "الإشعارات مفعلة", "notif_off": "الإشعارات معطلة",
         "backup_owner": "المالك الاحتياطي",
     },
     "ru": {
-        "welcome": "С возвращением",
-        "denied": "Доступ запрещён",
+        "welcome": "С возвращением", "denied": "Доступ запрещён",
         "paid_bot": "Это платный сервис",
         "contact_owner": "Связаться с владельцем",
-        "my_settings": "Мои настройки",
-        "my_channels": "Мои каналы",
-        "notifications": "Уведомления",
-        "language": "Язык",
-        "info": "Инфо",
-        "support": "Поддержка",
-        "home": "Меню",
-        "back": "Назад",
-        "cancel": "Отмена",
-        "send": "Отправить",
-        "choose_language": "Выбрать язык",
-        "language_changed": "Язык изменён!",
+        "my_settings": "Мои настройки", "my_channels": "Мои каналы",
+        "notifications": "Уведомления", "language": "Язык",
+        "info": "Инфо", "support": "Поддержка", "home": "Меню",
+        "back": "Назад", "cancel": "Отмена", "send": "Отправить",
+        "choose_language": "Выбрать язык", "language_changed": "Язык изменён!",
         "no_channels": "Каналы ещё не настроены",
         "waiting_approval": "Ожидание одобрения владельца",
-        "active": "Активно",
-        "paused": "Приостановлено",
+        "active": "Активно", "paused": "Приостановлено",
         "reactions_per_post": "реакций на пост",
         "contact_for_changes": "Свяжитесь с владельцем для изменений",
-        "added_on": "Добавлено",
-        "total_sent": "Всего отправлено",
-        "last_post": "Последний пост",
-        "last_run": "Последний запуск",
-        "never": "Никогда",
-        "history": "История",
+        "added_on": "Добавлено", "total_sent": "Всего отправлено",
+        "last_post": "Последний пост", "last_run": "Последний запуск",
+        "never": "Никогда", "history": "История",
         "no_history": "Истории пока нет",
         "you_are_whitelisted": "Вы в белом списке",
         "not_whitelisted": "Вас нет в белом списке",
-        "notif_on": "Уведомления вкл",
-        "notif_off": "Уведомления выкл",
+        "notif_on": "Уведомления вкл", "notif_off": "Уведомления выкл",
         "backup_owner": "Резервный владелец",
     },
     "es": {
-        "welcome": "Bienvenido",
-        "denied": "Acceso Denegado",
+        "welcome": "Bienvenido", "denied": "Acceso Denegado",
         "paid_bot": "Este es un servicio de pago",
         "contact_owner": "Contactar al dueño",
-        "my_settings": "Mis Ajustes",
-        "my_channels": "Mis Canales",
-        "notifications": "Notificaciones",
-        "language": "Idioma",
-        "info": "Info",
-        "support": "Soporte",
-        "home": "Inicio",
-        "back": "Atrás",
-        "cancel": "Cancelar",
-        "send": "Enviar",
-        "choose_language": "Elegir idioma",
-        "language_changed": "¡Idioma cambiado!",
+        "my_settings": "Mis Ajustes", "my_channels": "Mis Canales",
+        "notifications": "Notificaciones", "language": "Idioma",
+        "info": "Info", "support": "Soporte", "home": "Inicio",
+        "back": "Atrás", "cancel": "Cancelar", "send": "Enviar",
+        "choose_language": "Elegir idioma", "language_changed": "¡Idioma cambiado!",
         "no_channels": "Sin canales configurados",
         "waiting_approval": "Esperando aprobación del dueño",
-        "active": "Activo",
-        "paused": "Pausado",
+        "active": "Activo", "paused": "Pausado",
         "reactions_per_post": "reacciones/post",
         "contact_for_changes": "Contacta al dueño para cambios",
-        "added_on": "Añadido el",
-        "total_sent": "Total Enviado",
-        "last_post": "Último Post",
-        "last_run": "Última Ejecución",
-        "never": "Nunca",
-        "history": "Historial",
+        "added_on": "Añadido el", "total_sent": "Total Enviado",
+        "last_post": "Último Post", "last_run": "Última Ejecución",
+        "never": "Nunca", "history": "Historial",
         "no_history": "Sin historial aún",
         "you_are_whitelisted": "Estás en la whitelist",
         "not_whitelisted": "No estás en la whitelist",
-        "notif_on": "Notificaciones ON",
-        "notif_off": "Notificaciones OFF",
+        "notif_on": "Notificaciones ON", "notif_off": "Notificaciones OFF",
         "backup_owner": "Dueño de Respaldo",
     },
     "id": {
-        "welcome": "Selamat Datang",
-        "denied": "Akses Ditolak",
+        "welcome": "Selamat Datang", "denied": "Akses Ditolak",
         "paid_bot": "Ini adalah layanan berbayar",
         "contact_owner": "Hubungi Pemilik",
-        "my_settings": "Pengaturan Saya",
-        "my_channels": "Channel Saya",
-        "notifications": "Notifikasi",
-        "language": "Bahasa",
-        "info": "Info",
-        "support": "Dukungan",
-        "home": "Menu",
-        "back": "Kembali",
-        "cancel": "Batal",
-        "send": "Kirim",
-        "choose_language": "Pilih Bahasa",
-        "language_changed": "Bahasa diubah!",
+        "my_settings": "Pengaturan Saya", "my_channels": "Channel Saya",
+        "notifications": "Notifikasi", "language": "Bahasa",
+        "info": "Info", "support": "Dukungan", "home": "Menu",
+        "back": "Kembali", "cancel": "Batal", "send": "Kirim",
+        "choose_language": "Pilih Bahasa", "language_changed": "Bahasa diubah!",
         "no_channels": "Belum ada channel",
         "waiting_approval": "Menunggu persetujuan pemilik",
-        "active": "Aktif",
-        "paused": "Dijeda",
+        "active": "Aktif", "paused": "Dijeda",
         "reactions_per_post": "reaksi/post",
         "contact_for_changes": "Hubungi pemilik untuk mengubah",
-        "added_on": "Ditambahkan",
-        "total_sent": "Total Terkirim",
-        "last_post": "Post Terakhir",
-        "last_run": "Terakhir Jalan",
-        "never": "Tidak pernah",
-        "history": "Riwayat",
+        "added_on": "Ditambahkan", "total_sent": "Total Terkirim",
+        "last_post": "Post Terakhir", "last_run": "Terakhir Jalan",
+        "never": "Tidak pernah", "history": "Riwayat",
         "no_history": "Belum ada riwayat",
         "you_are_whitelisted": "Anda di whitelist",
         "not_whitelisted": "Anda tidak di whitelist",
-        "notif_on": "Notifikasi AKTIF",
-        "notif_off": "Notifikasi MATI",
+        "notif_on": "Notifikasi AKTIF", "notif_off": "Notifikasi MATI",
         "backup_owner": "Pemilik Cadangan",
     },
 }
 
 
 def L(uid, key):
-    """Get translated string for user's language"""
     if uid is None:
         return LANG_STRINGS["en"].get(key, key)
     try:
@@ -1183,10 +1062,8 @@ def L_static(lang, key):
 
 # ══════════════════════ MESSAGE TEMPLATES ══════════════════════
 def get_denied_message(uid=None):
-    """Access denied for non-whitelisted users"""
     owner = get_owner_username()
     owner_id = get_owner_id()
-
     return (
         f"{STAR_LINE}\n"
         f"🔒 **{L(uid, 'denied')}** 🔒\n"
@@ -1211,7 +1088,6 @@ def get_denied_message(uid=None):
 
 
 def get_welcome_message(uid):
-    """Welcome message for whitelisted users"""
     u = db_get_user(uid)
     if not u:
         return get_denied_message(uid)
@@ -1230,8 +1106,7 @@ def get_welcome_message(uid):
         for i, ch in enumerate(channels[:5], 1):
             ch_title = ch[4] or ch[3] or "Unknown"
             cnt = ch[5]
-            is_act = ch[8]
-            st = "🟢" if is_act else "🔴"
+            st = "🟢" if ch[8] else "🔴"
             channels_txt += f"{st} **{i}.** {ch_title[:30]}\n"
             channels_txt += f"      💫 {cnt}/post\n"
         if len(channels) > 5:
@@ -1267,7 +1142,6 @@ def get_welcome_message(uid):
 
 
 def get_settings_message(uid):
-    """Detailed settings view"""
     u = db_get_user(uid)
     if not u:
         return get_denied_message(uid)
@@ -1335,7 +1209,6 @@ def get_settings_message(uid):
 
 
 def get_channel_info_message(uid, channel_id):
-    """Detailed channel view for user"""
     ch = db_get_channel(channel_id)
     if not ch:
         return "❌ Channel not found"
@@ -1374,9 +1247,7 @@ def get_channel_info_message(uid, channel_id):
     )
 
 
-# ══════════════════════ OWNER MESSAGES ══════════════════════
 def get_owner_dashboard_message():
-    """Owner stats dashboard"""
     users = db_count_users()
     active_users = db_count_active_users()
     channels = db_count_channels()
@@ -1408,7 +1279,6 @@ def get_owner_dashboard_message():
 
 
 def get_owner_user_view(user_id):
-    """Owner view of a user"""
     u = db_get_user(user_id)
     if not u:
         return "❌ User not found"
@@ -1448,7 +1318,6 @@ def get_owner_user_view(user_id):
 
 
 def get_help_text(uid=None):
-    """Help message"""
     owner = get_owner_username()
     return (
         f"{STAR_LINE}\n"
@@ -1475,12 +1344,7 @@ def get_help_text(uid=None):
 
 # ══════════════════════ SESSION MANAGER ══════════════════════
 async def get_real_client(sf):
-    """
-    Get or create a real client from .session file.
-    Handles MAX_CLIENTS limit + reconnection.
-    """
     async with REAL_CLIENT_LOCK:
-        # MAX_CLIENTS limit
         if len(REAL_CLIENTS) >= MAX_CLIENTS:
             to_remove = list(REAL_CLIENTS.keys())[
                 :max(1, len(REAL_CLIENTS) - MAX_CLIENTS + 1)]
@@ -1492,7 +1356,6 @@ async def get_real_client(sf):
                 REAL_CLIENTS.pop(k, None)
                 DBG(f"Client evicted (RAM limit): {k}", "warn")
 
-        # Return cached
         if sf in REAL_CLIENTS:
             c = REAL_CLIENTS[sf]
             try:
@@ -1506,7 +1369,6 @@ async def get_real_client(sf):
                 pass
             REAL_CLIENTS.pop(sf, None)
 
-        # Create new
         path = os.path.join(SESSIONS_DIR, sf.replace(".session", ""))
         if not os.path.exists(path + ".session"):
             DBG(f"Session file not found: {sf}", "warn")
@@ -1528,7 +1390,6 @@ async def get_real_client(sf):
 
 
 async def close_all_real_clients():
-    """Disconnect all loaded clients"""
     async with REAL_CLIENT_LOCK:
         for sf, c in list(REAL_CLIENTS.items()):
             try:
@@ -1538,12 +1399,8 @@ async def close_all_real_clients():
         REAL_CLIENTS.clear()
 
 
-# ══════════════════════ JOIN CHAT (Auto) ══════════════════════
+# ══════════════════════ JOIN CHAT ══════════════════════
 async def session_join_chat(sf, chat_ref, invite_hash=None):
-    """
-    Make a session join a chat/channel.
-    Returns (ok, reason)
-    """
     if is_session_flooded(sf):
         return False, "flooded"
 
@@ -1599,7 +1456,6 @@ async def session_join_chat(sf, chat_ref, invite_hash=None):
 
 async def join_chat_with_sessions(chat_link, chat_id=None,
                                    max_sessions=20):
-    """Join a chat using multiple sessions."""
     chat_ref, invite_hash = parse_chat_link(chat_link)
     if not chat_ref and not invite_hash:
         return 0, 0, 0
@@ -1637,7 +1493,6 @@ async def join_chat_with_sessions(chat_link, chat_id=None,
 
 
 def parse_chat_link(link):
-    """Parse chat link → (chat_ref, invite_hash)"""
     if not link:
         return None, None
     link = link.strip()
@@ -1659,10 +1514,13 @@ def parse_chat_link(link):
     return link, None
 
 
-# ══════════════════════ SINGLE REACTION ══════════════════════
-async def session_send_reaction(sf, chat_ref, msg_id, emoji):
+# ══════════════════════ ✅ SMART EMOJI FALLBACK ══════════════════════
+async def session_send_reaction(sf, chat_ref, msg_id, emoji,
+                                 emoji_pool=None):
     """
     Send a reaction from a session.
+    SMART: Agar user ka emoji invalid ho to USI POOL se doosra try karo
+    Jab tak koi emoji lage ya sab try ho jayein.
     Returns (ok, used_emoji, error)
     """
     if is_session_flooded(sf):
@@ -1679,44 +1537,65 @@ async def session_send_reaction(sf, chat_ref, msg_id, emoji):
     except Exception as e:
         return False, emoji, f"resolve: {str(e)[:60]}"
 
-    try:
-        await asyncio.wait_for(
-            client(SendReactionRequest(
-                peer=entity,
-                msg_id=msg_id,
-                reaction=[ReactionEmoji(emoticon=emoji)])),
-            timeout=REAL_REACTION_TIMEOUT)
-        return True, emoji, ""
-    except FloodWaitError as e:
-        mark_session_flooded(sf, e.seconds + 10)
-        return False, emoji, f"flood:{e.seconds}"
-    except Exception as e:
-        err = str(e)[:80]
-        for fb in FALLBACK_REACTIONS:
-            if fb == emoji:
+    # ── Build fallback list (user's pool first, then shuffle) ──
+    if emoji_pool and len(emoji_pool) > 0:
+        fb_pool = list(emoji_pool)
+    else:
+        fb_pool = FALLBACK_REACTIONS.copy()
+
+    random.shuffle(fb_pool)
+
+    # Pehle user ka emoji, phir baaki pool
+    try_list = [emoji] + [e for e in fb_pool if e != emoji]
+
+    # ── Try each emoji until one works ──
+    last_err = ""
+    for try_emoji in try_list:
+        try:
+            await asyncio.wait_for(
+                client(SendReactionRequest(
+                    peer=entity,
+                    msg_id=msg_id,
+                    reaction=[ReactionEmoji(emoticon=try_emoji)])),
+                timeout=REAL_REACTION_TIMEOUT)
+
+            if try_emoji != emoji:
+                DBG(f"⚠️ {sf}: {emoji} failed → used {try_emoji}", "react")
+            return True, try_emoji, ""
+
+        except FloodWaitError as e:
+            mark_session_flooded(sf, e.seconds + 10)
+            return False, emoji, f"flood:{e.seconds}"
+
+        except Exception as e:
+            err_str = str(e)
+            last_err = err_str[:80]
+
+            # Sirf invalid emoji pe next try karo
+            if ("Invalid reaction" in err_str or
+                "only emoji" in err_str or
+                "REACTION_INVALID" in err_str):
+                DBG(f"↻ {sf}: {try_emoji} invalid, trying next", "react")
                 continue
-            try:
-                await asyncio.wait_for(
-                    client(SendReactionRequest(
-                        peer=entity,
-                        msg_id=msg_id,
-                        reaction=[ReactionEmoji(emoticon=fb)])),
-                    timeout=REAL_REACTION_TIMEOUT)
-                return True, fb, f"fallback ({err[:40]})"
-            except FloodWaitError as fe:
-                mark_session_flooded(sf, fe.seconds + 10)
-                return False, emoji, f"flood:{fe.seconds}"
-            except Exception:
-                continue
-        return False, emoji, err
+
+            # Baaki errors (chat restricted, etc.) — stop
+            return False, emoji, last_err
+
+    # Saare emojis try kiye, koi nahi laga
+    return False, emoji, f"all_emojis_failed: {last_err[:60]}"
 
 
-# ══════════════════════ SEND REACTIONS FROM SESSIONS ══════════════════════
+# ══════════════════════ ✅ SEND REACTIONS (WITH RETRY) ══════════════════════
 async def send_reactions_from_sessions(chat_link, msg_id, count,
                                         emoji_mode="default",
                                         custom_emojis=None,
                                         on_progress=None):
-    """Send N reactions using multiple sessions."""
+    """
+    Send N reactions using multiple sessions.
+    - Failed session → next session try
+    - Invalid emoji → next emoji from pool
+    - Full count poora karne ki koshish
+    """
     result = {"ok": 0, "fail": 0, "flooded": 0, "total": 0}
 
     if count <= 0:
@@ -1735,55 +1614,90 @@ async def send_reactions_from_sessions(chat_link, msg_id, count,
         return result
 
     random.shuffle(available)
-    senders = available[:min(count, len(available))]
-    result["total"] = len(senders)
+    result["total"] = count
 
-    DBG(f"Sending {len(senders)} reactions to {chat_link} #{msg_id}",
-        "react")
+    DBG(f"Sending {count} reactions to {chat_link} #{msg_id}", "react")
 
+    # ── Build emoji pool ──
     if emoji_mode == "custom" and custom_emojis:
         valid = [e for e in custom_emojis if e in ALL_REACTIONS]
-        pool = valid if valid else DEFAULT_REACTIONS.copy()
+        base_pool = valid if valid else FALLBACK_REACTIONS.copy()
     else:
-        pool = ALL_REACTIONS.copy()
-    random.shuffle(pool)
+        base_pool = DEFAULT_REACTIONS.copy()
 
-    for i, sf in enumerate(senders, 1):
+    # Full emoji plan (user's emojis first, then repeat from pool)
+    full_emojis = []
+    full_emojis.extend(base_pool)
+    while len(full_emojis) < count:
+        full_emojis.append(random.choice(base_pool))
+    full_emojis = full_emojis[:count]
+
+    DBG(f"Emoji plan ({len(full_emojis)}): {full_emojis[:15]}...", "react")
+
+    # ── Try sessions until count reached ──
+    tried_sessions = set()
+    ok_count = 0
+    fail_count = 0
+    flood_count = 0
+
+    max_attempts = len(available) * 3
+    attempts = 0
+
+    while ok_count < count and attempts < max_attempts:
+        attempts += 1
+
+        untried = [s for s in available if s not in tried_sessions]
+        if not untried:
+            DBG(f"All sessions tried. Sent {ok_count}/{count}", "react")
+            break
+
+        sf = untried[0]
+        tried_sessions.add(sf)
+
         if is_session_flooded(sf):
-            result["flooded"] += 1
+            flood_count += 1
             continue
 
-        emoji = pool.pop(0) if pool else random.choice(DEFAULT_REACTIONS)
-
-        ok, used_emoji, err = await session_send_reaction(
-            sf, chat_ref, msg_id, emoji)
-
-        if ok:
-            result["ok"] += 1
-            db_log_session_use(sf, True)
-        elif "flood" in err:
-            result["flooded"] += 1
+        # Pick emoji
+        if ok_count < len(full_emojis):
+            emoji = full_emojis[ok_count]
         else:
-            result["fail"] += 1
-            DBG(f"{sf} fail: {err[:80]}", "fail")
+            emoji = random.choice(base_pool)
 
-        if on_progress and (i % 5 == 0 or i == len(senders)):
+        success, used_emoji, err = await session_send_reaction(
+            sf, chat_ref, msg_id, emoji,
+            emoji_pool=base_pool)
+
+        if success:
+            ok_count += 1
+            result["ok"] = ok_count
+            db_log_session_use(sf, True)
+            DBG(f"✅ {sf}: {used_emoji} ({ok_count}/{count})", "react")
+        elif "flood" in err:
+            flood_count += 1
+        else:
+            fail_count += 1
+            DBG(f"❌ {sf}: {err[:60]}", "fail")
+
+        if on_progress and ok_count > 0 and ok_count % 5 == 0:
             try:
-                await on_progress(i, len(senders), result["ok"])
+                await on_progress(ok_count, count, ok_count)
             except Exception:
                 pass
 
         await asyncio.sleep(REAL_COOLDOWN)
 
-    DBG(f"Reactions done: ✅{result['ok']} ❌{result['fail']} "
-        f"🌊{result['flooded']}", "react")
+    result["fail"] = fail_count
+    result["flooded"] = flood_count
+
+    DBG(f"Reactions done: ✅{ok_count}/{count} ❌{fail_count} "
+        f"🌊{flood_count}", "react")
 
     return result
 
 
-# ══════════════════════ VERIFY POST EXISTS ══════════════════════
+# ══════════════════════ VERIFY POST ══════════════════════
 async def verify_post_exists(chat_ref, msg_id, invite_hash=None):
-    """Check if a post exists in the chat."""
     if admin_client:
         try:
             entity = await asyncio.wait_for(
@@ -1820,7 +1734,6 @@ async def verify_post_exists(chat_ref, msg_id, invite_hash=None):
 
 # ══════════════════════ GET LATEST POSTS ══════════════════════
 async def get_latest_posts(chat_id, limit=5):
-    """Get latest posts from a chat."""
     if admin_client:
         try:
             entity = await asyncio.wait_for(
@@ -1855,7 +1768,6 @@ async def get_latest_posts(chat_id, limit=5):
 
 
 def get_newest_post_id(msgs):
-    """Extract newest post ID"""
     if not msgs:
         return 0
     try:
@@ -1864,7 +1776,7 @@ def get_newest_post_id(msgs):
         return 0
 
 
-# ══════════════════════ USER VALIDATION ══════════════════════
+# ══════════════════════ VALIDATION ══════════════════════
 def is_admin(uid):
     return OWNER_IS(uid)
 
@@ -1881,7 +1793,6 @@ def can_use_bot(uid):
 
 # ══════════════════════ BUTTON HELPER ══════════════════════
 def btn(text, data=None, url=None, style=None):
-    """Create button with optional style"""
     if url:
         b = Button.url(text, url)
     else:
@@ -1901,7 +1812,6 @@ def btn(text, data=None, url=None, style=None):
 
 # ══════════════════════ SAFE EDIT / ANSWER ══════════════════════
 async def safe_edit(event, text, buttons=None, alert=None):
-    """Safely edit message"""
     try:
         if alert:
             try:
@@ -1943,7 +1853,6 @@ async def safe_edit(event, text, buttons=None, alert=None):
 
 
 async def safe_answer(event, text=None, alert=False):
-    """Safely answer callback"""
     try:
         if text:
             await event.answer(text, alert=alert)
@@ -1955,7 +1864,6 @@ async def safe_answer(event, text=None, alert=False):
 
 # ══════════════════════ ENTITY CACHE ══════════════════════
 async def safe_get_entity(ref, cache_key=None, cache_store=None):
-    """Get entity with cache + multi-session fallback."""
     if cache_key is None:
         cache_key = str(ref)
     if cache_store is None:
@@ -2003,16 +1911,14 @@ async def safe_get_entity(ref, cache_key=None, cache_store=None):
     raise Exception("Could not resolve entity")
 
 
-# ══════════════════════ ✅ NEW: RESOLVE USERNAME TO ID ══════════════════════
+# ══════════════════════ RESOLVE USERNAME ══════════════════════
 async def resolve_username_to_id(username):
-    """Resolve @username to numeric ID via Telegram (using sessions)"""
     if not username:
         return None, None, None
     username = username.lstrip("@").strip()
     if not username:
         return None, None, None
 
-    # Try each session until one resolves
     for sf in discover_sessions()[:10]:
         if is_session_flooded(sf):
             continue
@@ -2037,7 +1943,6 @@ async def resolve_username_to_id(username):
 
 # ══════════════════════ RESOLVE CHAT INFO ══════════════════════
 async def resolve_chat_info(chat_link):
-    """Resolve chat info from link."""
     chat_ref, invite_hash = parse_chat_link(chat_link)
     if not chat_ref and not invite_hash:
         return None, None, None, None
@@ -2058,7 +1963,6 @@ async def resolve_chat_info(chat_link):
 
 # ══════════════════════ CHECK SESSION ACCESS ══════════════════════
 async def check_session_access(chat_ref, invite_hash=None):
-    """Check how many sessions can access this chat."""
     accessible = 0
     sessions = discover_sessions()[:5]
     for sf in sessions:
@@ -2091,7 +1995,6 @@ def set_task_running(running, user_id=None):
 
 # ══════════════════════ PARSE INPUTS ══════════════════════
 def parse_user_input_id(text):
-    """Parse numeric user ID only (username resolve alag)"""
     text = (text or "").strip()
     if not text:
         return None
@@ -2101,7 +2004,6 @@ def parse_user_input_id(text):
 
 
 def parse_emoji_input(text):
-    """Parse emojis from text"""
     if not text:
         return []
     parts = re.split(r"[,\s]+", text.strip())
@@ -2113,7 +2015,6 @@ def parse_emoji_input(text):
 
 
 def parse_reaction_count(text, min_val=1, max_val=100):
-    """Parse count from text"""
     text = (text or "").strip()
     if not text.isdigit():
         return None
@@ -2169,15 +2070,9 @@ def can_send_reactions():
 
 
 # ══════════════════════ END OF PART 2 ══════════════════════
-print("[STARTUP] Part 2 loaded (Languages + Templates + Sessions)", flush=True)
-# ══════════════════════ BACKGROUND WORKER — MAIN LOOP ══════════════════════
+print("[STARTUP] Part 2 loaded (Languages + Templates + Smart Sessions)", flush=True)
+   # ══════════════════════ BACKGROUND WORKER — MAIN LOOP ══════════════════════
 async def auto_watch_loop():
-    """
-    Main background worker:
-    - Har 10 min check karo
-    - Har user ka har channel check karo
-    - Naya post → auto-join sessions → reactions → notify user
-    """
     global TASK_RUNNING, TASK_USER_ID
 
     await asyncio.sleep(15)
@@ -2238,12 +2133,6 @@ async def auto_watch_loop():
 
 # ══════════════════════ PROCESS ONE CHANNEL ══════════════════════
 async def process_channel_check(ch):
-    """
-    Check a single channel for new posts.
-    ch = (id, user_id, chat_id, chat_link, chat_title, reaction_count,
-          emoji_mode, custom_emojis, is_active, joined, last_post_id,
-          last_run, total_reactions, fail_count, created_at)
-    """
     (channel_id, user_id, chat_id, chat_link, chat_title,
      reaction_count, emoji_mode, custom_emojis, is_active, joined,
      last_post_id, last_run, total_reactions, fail_count, created) = ch
@@ -2309,7 +2198,21 @@ async def process_channel_check(ch):
         chat_str = str(chat_id).replace("-100", "")
         post_link = f"https://t.me/c/{chat_str}/{newest}"
 
-        ce_list = custom_emojis.split(",") if custom_emojis else None
+        # ✅ Parse custom emojis properly
+        ce_list = None
+        if custom_emojis:
+            if isinstance(custom_emojis, str):
+                ce_list = [e.strip() for e in custom_emojis.split(",")
+                           if e.strip() and e.strip() in ALL_REACTIONS]
+            elif isinstance(custom_emojis, (list, tuple)):
+                ce_list = [e for e in custom_emojis
+                           if e in ALL_REACTIONS]
+
+        emode = emoji_mode
+        if emode == "custom" and not ce_list:
+            emode = "default"
+            DBG(f"Custom emojis empty for ch#{channel_id} — using default",
+                "warn")
 
         async def on_prog(i, total, ok):
             pass
@@ -2318,7 +2221,7 @@ async def process_channel_check(ch):
             chat_link=chat_link,
             msg_id=newest,
             count=reaction_count,
-            emoji_mode=emoji_mode,
+            emoji_mode=emode,
             custom_emojis=ce_list,
             on_progress=on_prog)
 
@@ -2352,10 +2255,9 @@ async def process_channel_check(ch):
     return result
 
 
-# ══════════════════════ ✅ FULL ORDER NOTIFICATION ══════════════════════
+# ══════════════════════ FULL ORDER NOTIFICATION ══════════════════════
 async def notify_user_reactions(user_id, chat_title, post_id,
                                  sent, requested, post_link=None):
-    """Notify whitelisted user with FULL details"""
     try:
         u = db_get_user(user_id)
         if not u:
@@ -2364,29 +2266,7 @@ async def notify_user_reactions(user_id, chat_title, post_id,
         if not notify:
             return
 
-        # Get channel link from DB
-        channel_link = None
-        try:
-            conn = sqlite3.connect(DB_FILE)
-            try:
-                row = conn.execute("""SELECT chat_link
-                    FROM user_channels
-                    WHERE user_id=? AND chat_title=?
-                    ORDER BY id DESC LIMIT 1""",
-                    (user_id, chat_title)).fetchone()
-                if row:
-                    channel_link = row[0]
-            finally:
-                conn.close()
-        except Exception:
-            pass
-
-        # Short DB save
-        short_msg = (f"📡 {chat_title[:40]} | "
-                     f"#{post_id} | {sent}/{requested}")
-        db_add_notification(user_id, short_msg)
-
-        # Build FULL message
+        # Build FULL message first
         fail_count = max(0, requested - sent)
         success_rate = int((sent / requested) * 100) if requested > 0 else 0
 
@@ -2422,25 +2302,54 @@ async def notify_user_reactions(user_id, chat_title, post_id,
             f"✅ **Status:** Complete"
         )
 
+        # Short DB save
+        short_msg = (f"📡 {chat_title[:40]} | "
+                     f"#{post_id} | {sent}/{requested}")
+        db_add_notification(user_id, short_msg)
+
+        # ✅ Try bot first, then via sessions if fails
+        sent_ok = False
         try:
             await bot.send_message(
                 user_id,
                 full_msg,
                 buttons=[
-                    [btn("🏠 Home", data=b"home",
-                         style="primary"),
+                    [btn("🏠 Home", data=b"home", style="primary"),
                      btn("📜 History", data=b"u:history",
                          style="success")]
                 ])
+            sent_ok = True
         except Exception as e:
-            DBG(f"Notify user {user_id} fail: {str(e)[:60]}", "warn")
+            DBG(f"Bot send failed {user_id}: {str(e)[:60]} — trying via session",
+                "warn")
+
+        if not sent_ok:
+            # Fallback: via sessions
+            for sf in discover_sessions()[:5]:
+                if is_session_flooded(sf):
+                    continue
+                try:
+                    client = await get_real_client(sf)
+                    if not client:
+                        continue
+                    await asyncio.wait_for(
+                        client.send_message(user_id, full_msg),
+                        timeout=15)
+                    DBG(f"✅ Sent via {sf} to {user_id}", "ok")
+                    sent_ok = True
+                    break
+                except Exception:
+                    continue
+
+        if not sent_ok:
+            DBG(f"❌ Could not notify user {user_id}", "warn")
+
     except Exception as e:
         DBG(f"notify_user_reactions error: {str(e)[:80]}", "warn")
 
 
 # ══════════════════════ CLEANUP LOOP ══════════════════════
 async def cleanup_loop():
-    """Periodic cleanup — every 1 min"""
     await asyncio.sleep(30)
     DBG("Cleanup loop started", "sync")
 
@@ -2475,7 +2384,6 @@ async def cleanup_loop():
 
 # ══════════════════════ HEALTH LOOP ══════════════════════
 async def health_loop():
-    """Log health every 5 min"""
     while True:
         try:
             await asyncio.sleep(HEALTH_INTERVAL)
@@ -2493,13 +2401,9 @@ async def health_loop():
             pass
 
 
-# ══════════════════════ ✅ AUTO-CLEANUP EXPIRED SESSIONS ══════════════════════
+# ══════════════════════ AUTO-CLEANUP EXPIRED SESSIONS ══════════════════════
 async def auto_cleanup_sessions():
-    """
-    Har 30 min: sessions check karo, jo expired/unauthorized hain
-    unhein automatically remove kar do (file delete + owner report).
-    """
-    await asyncio.sleep(180)  # Initial delay
+    await asyncio.sleep(180)
     DBG("Auto-cleanup sessions loop started", "clean")
 
     while True:
@@ -2536,7 +2440,6 @@ async def auto_cleanup_sessions():
                             client.is_user_authorized(), timeout=10)
 
                         if not authorized:
-                            # ❌ Expired / logged out
                             await client.disconnect()
                             try:
                                 os.remove(session_file)
@@ -2555,7 +2458,6 @@ async def auto_cleanup_sessions():
                             removed_names.append(sf)
                             DBG(f"🗑️ Removed expired: {sf}", "clean")
                         else:
-                            # ✅ Test get_me (banned check)
                             try:
                                 await asyncio.wait_for(
                                     client.get_me(), timeout=8)
@@ -2597,7 +2499,6 @@ async def auto_cleanup_sessions():
             DBG(f"Auto-cleanup done: 🗑️ removed={removed} "
                 f"✅ kept={kept} ⚠️ errors={errors}", "clean")
 
-            # Owner report
             if removed > 0:
                 try:
                     sample = ", ".join(removed_names[:5])
@@ -2624,33 +2525,26 @@ async def auto_cleanup_sessions():
             await asyncio.sleep(300)
 
 
-# ══════════════════════ ✅ QUICK REACTION (Post Link) ══════════════════════
+# ══════════════════════ QUICK REACTION (Post Link) ══════════════════════
 async def send_reactions_to_link(post_link, count=10,
                                   emoji_mode="default",
                                   custom_emojis=None):
-    """
-    Kisi bhi post link par turant reactions bhejo.
-    Returns (ok_count, fail_count, total, error_msg)
-    """
     try:
         post_link = post_link.strip().split("?")[0]
 
         chat_ref = None
         msg_id = None
 
-        # ── t.me/c/CHAT_ID/MSG_ID (private) ──
         m = re.search(r"t\.me/c/(\d+)/(\d+)", post_link)
         if m:
             chat_id = int(m.group(1))
             chat_ref = int(f"-100{chat_id}")
             msg_id = int(m.group(2))
         else:
-            # ── t.me/+/invite/MSG_ID ──
             m = re.search(r"t\.me/\+([A-Za-z0-9_-]+)/(\d+)", post_link)
             if m:
                 invite_hash = m.group(1)
                 msg_id = int(m.group(2))
-                # Resolve invite
                 for sf in discover_sessions()[:5]:
                     if is_session_flooded(sf):
                         continue
@@ -2670,13 +2564,11 @@ async def send_reactions_to_link(post_link, count=10,
                 if not chat_ref:
                     return 0, 0, 0, "Invite link resolve nahi ho saka"
             else:
-                # ── t.me/channel/MSG ──
                 m = re.search(r"t\.me/([A-Za-z0-9_]+)/(\d+)", post_link)
                 if m:
                     chat_ref = f"@{m.group(1)}"
                     msg_id = int(m.group(2))
                 else:
-                    # ── @channel/MSG ──
                     m = re.search(r"@?([A-Za-z0-9_]+)/(\d+)", post_link)
                     if m:
                         chat_ref = f"@{m.group(1)}"
@@ -2703,8 +2595,7 @@ async def send_reactions_to_link(post_link, count=10,
             valid = [e for e in custom_emojis if e in ALL_REACTIONS]
             pool = valid if valid else DEFAULT_REACTIONS.copy()
         else:
-            pool = ALL_REACTIONS.copy()
-        random.shuffle(pool)
+            pool = DEFAULT_REACTIONS.copy()
 
         ok = fail = flooded = 0
 
@@ -2713,9 +2604,9 @@ async def send_reactions_to_link(post_link, count=10,
                 flooded += 1
                 continue
 
-            emoji = pool.pop(0) if pool else random.choice(DEFAULT_REACTIONS)
+            emoji = random.choice(pool)
             success, used, err = await session_send_reaction(
-                sf, chat_ref, msg_id, emoji)
+                sf, chat_ref, msg_id, emoji, emoji_pool=pool)
 
             if success:
                 ok += 1
@@ -2734,9 +2625,8 @@ async def send_reactions_to_link(post_link, count=10,
         return 0, 0, 0, str(e)[:100]
 
 
-# ══════════════════════ DAILY SUMMARY LOOP (FIXED) ══════════════════════
+# ══════════════════════ DAILY SUMMARY LOOP ══════════════════════
 async def daily_summary_loop():
-    """Send daily summary to owner"""
     last_sent = None
     while True:
         try:
@@ -2754,7 +2644,6 @@ async def daily_summary_loop():
 
 
 async def send_daily_summary():
-    """Build + send daily summary"""
     try:
         today_rx = db_reactions_today()
         total_rx = db_total_reactions()
@@ -2796,7 +2685,6 @@ async def send_daily_summary():
 
 # ══════════════════════ SESSION HEALTH CHECK ══════════════════════
 async def session_health_check():
-    """Verify session files periodically (lightweight)"""
     while True:
         try:
             await asyncio.sleep(1800)
@@ -2827,24 +2715,18 @@ async def session_health_check():
 
 # ══════════════════════ USER KEYBOARDS ══════════════════════
 def kb_user_home(uid):
-    """Main home keyboard for whitelisted user"""
     u = db_get_user(uid)
     notify_on = (u[6] == 1) if u else False
 
     return [
-        [btn(f"📊 My Settings", data=b"u:settings",
-             style="primary")],
-        [btn(f"📢 My Channels", data=b"u:channels",
-             style="primary"),
-         btn(f"📜 History", data=b"u:history",
-             style="primary")],
+        [btn(f"📊 My Settings", data=b"u:settings", style="primary")],
+        [btn(f"📢 My Channels", data=b"u:channels", style="primary"),
+         btn(f"📜 History", data=b"u:history", style="primary")],
         [btn(f"🔔 Notifications {'✅' if notify_on else '❌'}",
              data=b"u:toggle_notify",
              style="success" if notify_on else "danger")],
-        [btn(f"🌍 Language", data=b"u:language",
-             style="primary"),
-         btn(f"❓ Help", data=b"u:help",
-             style="success")],
+        [btn(f"🌍 Language", data=b"u:language", style="primary"),
+         btn(f"❓ Help", data=b"u:help", style="success")],
         [btn(f"💬 Contact Owner",
              url=f"https://t.me/{get_owner_username()}",
              style="success")],
@@ -2857,20 +2739,17 @@ def kb_user_back(uid=None):
 
 def kb_user_settings(uid):
     return [
-        [btn("📢 View Channels", data=b"u:channels",
-             style="success")],
+        [btn("📢 View Channels", data=b"u:channels", style="success")],
         [btn("🔙 Back", data=b"u:home", style="primary")],
     ]
 
 
 def kb_user_channels(uid):
-    """User channels list + Add button"""
     channels = db_list_channels(uid)
 
     if not channels:
         return [
-            [btn("➕ Add Channel", data=b"u:add_ch",
-                 style="success")],
+            [btn("➕ Add Channel", data=b"u:add_ch", style="success")],
             [btn("💬 Contact Owner",
                  url=f"https://t.me/{get_owner_username()}",
                  style="success")],
@@ -2881,9 +2760,7 @@ def kb_user_channels(uid):
     for ch in channels[:8]:
         cid = ch[0]
         chat_title = ch[4] or ch[3] or "Unknown"
-        cnt = ch[5]
-        is_act = ch[8]
-        st = "🟢" if is_act else "🔴"
+        st = "🟢" if ch[8] else "🔴"
         title_short = chat_title[:28]
         rows.append([
             btn(f"{st} {title_short}",
@@ -2894,13 +2771,11 @@ def kb_user_channels(uid):
     if len(channels) > 8:
         rows.append([
             btn(f"... +{len(channels) - 8} more",
-                data=b"u:channels_more",
-                style="primary")
+                data=b"u:channels_more", style="primary")
         ])
 
     rows.append([
-        btn("➕ Add Channel", data=b"u:add_ch",
-             style="success")
+        btn("➕ Add Channel", data=b"u:add_ch", style="success")
     ])
     rows.append([
         btn("🔙 Back", data=b"u:home", style="primary")
@@ -2912,26 +2787,19 @@ def kb_user_channels(uid):
 def kb_user_channel_detail(uid, channel_id):
     return [
         [btn("📜 History",
-             data=f"u:ch_hist:{channel_id}".encode(),
-             style="primary")],
+             data=f"u:ch_hist:{channel_id}".encode(), style="primary")],
         [btn("✏️ Edit Count",
-             data=f"u:ch_count:{channel_id}".encode(),
-             style="primary"),
+             data=f"u:ch_count:{channel_id}".encode(), style="primary"),
          btn("✏️ Edit Emojis",
-             data=f"u:ch_emoji:{channel_id}".encode(),
-             style="primary")],
+             data=f"u:ch_emoji:{channel_id}".encode(), style="primary")],
         [btn("✏️ Edit Link",
-             data=f"u:ch_link:{channel_id}".encode(),
-             style="primary"),
+             data=f"u:ch_link:{channel_id}".encode(), style="primary"),
          btn("🔄 Re-join",
-             data=f"u:ch_rejoin:{channel_id}".encode(),
-             style="success")],
+             data=f"u:ch_rejoin:{channel_id}".encode(), style="success")],
         [btn("🗑️ Remove",
-             data=f"u:ch_del:{channel_id}".encode(),
-             style="danger")],
+             data=f"u:ch_del:{channel_id}".encode(), style="danger")],
         [btn("💬 Contact Owner",
-             url=f"https://t.me/{get_owner_username()}",
-             style="success")],
+             url=f"https://t.me/{get_owner_username()}", style="success")],
         [btn("🔙 Back", data=b"u:channels", style="primary")],
     ]
 
@@ -2939,11 +2807,9 @@ def kb_user_channel_detail(uid, channel_id):
 def kb_user_channel_history(uid, channel_id):
     return [
         [btn("🔄 Refresh",
-             data=f"u:ch_hist:{channel_id}".encode(),
-             style="success")],
+             data=f"u:ch_hist:{channel_id}".encode(), style="success")],
         [btn("🔙 Back",
-             data=f"u:ch:{channel_id}".encode(),
-             style="primary")],
+             data=f"u:ch:{channel_id}".encode(), style="primary")],
     ]
 
 
@@ -2974,8 +2840,7 @@ def kb_user_history(uid):
 def kb_user_help(uid):
     return [
         [btn("💬 Contact Owner",
-             url=f"https://t.me/{get_owner_username()}",
-             style="success")],
+             url=f"https://t.me/{get_owner_username()}", style="success")],
         [btn("🔙 Back", data=b"u:home", style="primary")],
     ]
 
@@ -2989,13 +2854,10 @@ def kb_user_notifications(uid):
 
 
 def kb_denied(uid=None):
-    """Keyboard for non-whitelisted users"""
     return [
         [btn("💬 Contact Owner",
-             url=f"https://t.me/{get_owner_username()}",
-             style="success")],
-        [btn("ℹ️ About This Bot", data=b"d:about",
-             style="primary")],
+             url=f"https://t.me/{get_owner_username()}", style="success")],
+        [btn("ℹ️ About This Bot", data=b"d:about", style="primary")],
     ]
 
 
@@ -3087,37 +2949,26 @@ def build_user_history_text(uid):
 print("[STARTUP] Part 3 loaded (Workers + Auto-Cleanup + Quick React + Keyboards)", flush=True)
 # ══════════════════════ OWNER MAIN PANEL ══════════════════════
 def kb_owner_home():
-    """Owner main dashboard"""
     users = db_count_users()
     channels = db_count_channels()
     sessions = get_sessions_status()
     owner_channels = db_list_channels(get_owner_id())
 
     return [
-        [btn(f"👥 Users ({users})", data=b"o:users",
-             style="primary"),
-         btn(f"📢 Channels ({channels})", data=b"o:channels",
-             style="primary")],
+        [btn(f"👥 Users ({users})", data=b"o:users", style="primary"),
+         btn(f"📢 Channels ({channels})", data=b"o:channels", style="primary")],
         [btn(f"🔐 Sessions ({sessions['available']}/{sessions['total']})",
              data=b"o:sessions", style="success"),
-         btn("📊 Analytics", data=b"o:analytics",
-             style="success")],
-        [btn("⚡ Quick Reaction", data=b"o:quick_react",
-             style="danger"),
-         btn("📜 Recent Activity", data=b"o:recent",
-             style="primary")],
-        [btn("🔄 Run Check Now", data=b"o:run_check",
-             style="success"),
-         btn("📢 Broadcast", data=b"o:broadcast",
-             style="danger")],
-        [btn("📋 Notifications", data=b"o:notifications",
-             style="primary"),
+         btn("📊 Analytics", data=b"o:analytics", style="success")],
+        [btn("⚡ Quick Reaction", data=b"o:quick_react", style="danger"),
+         btn("📜 Recent Activity", data=b"o:recent", style="primary")],
+        [btn("🔄 Run Check Now", data=b"o:run_check", style="success"),
+         btn("📢 Broadcast", data=b"o:broadcast", style="danger")],
+        [btn("📋 Notifications", data=b"o:notifications", style="primary"),
          btn(f"👤 My Channels ({len(owner_channels)})",
              data=b"u:channels", style="success")],
-        [btn("⚙️ Settings", data=b"o:settings",
-             style="primary"),
-         btn("🌍 Owner Info", data=b"o:owner_info",
-             style="success")],
+        [btn("⚙️ Settings", data=b"o:settings", style="primary"),
+         btn("🌍 Owner Info", data=b"o:owner_info", style="success")],
         [btn("🔙 Main", data=b"home", style="danger")],
     ]
 
@@ -3126,7 +2977,6 @@ def kb_owner_back():
     return [[btn("🔙 Back", data=b"o:home", style="primary")]]
 
 
-# ══════════════════════ USERS MANAGEMENT ══════════════════════
 def kb_owner_users(page=0):
     per_page = 10
     users = db_list_users(limit=per_page, offset=page * per_page)
@@ -3140,8 +2990,7 @@ def kb_owner_users(page=0):
         name = (first_name or "User")[:20]
         rows.append([
             btn(f"{st} {name} — `{u_id}`",
-                data=f"o:user:{u_id}".encode(),
-                style="primary")
+                data=f"o:user:{u_id}".encode(), style="primary")
         ])
 
     if not users:
@@ -3152,12 +3001,10 @@ def kb_owner_users(page=0):
     nav = []
     if page > 0:
         nav.append(btn("⬅️ Prev",
-                       data=f"o:users:{page - 1}".encode(),
-                       style="primary"))
+                       data=f"o:users:{page - 1}".encode(), style="primary"))
     if page < total_pages - 1:
         nav.append(btn("Next ➡️",
-                       data=f"o:users:{page + 1}".encode(),
-                       style="primary"))
+                       data=f"o:users:{page + 1}".encode(), style="primary"))
     if nav:
         rows.append(nav)
 
@@ -3187,20 +3034,15 @@ def kb_owner_user_detail(user_id):
              data=f"o:user_toggle:{user_id}".encode(),
              style="success" if is_active else "danger")],
         [btn(f"📢 Channels ({len(channels)})",
-             data=f"o:user_channels:{user_id}".encode(),
-             style="primary")],
+             data=f"o:user_channels:{user_id}".encode(), style="primary")],
         [btn(f"➕ Add Channel",
-             data=f"o:user_add_ch:{user_id}".encode(),
-             style="success")],
+             data=f"o:user_add_ch:{user_id}".encode(), style="success")],
         [btn(f"🔔 Notify {'✅' if notify else '❌'}",
-             data=f"o:user_notify:{user_id}".encode(),
-             style="primary")],
+             data=f"o:user_notify:{user_id}".encode(), style="primary")],
         [btn(f"📝 Notes",
-             data=f"o:user_notes:{user_id}".encode(),
-             style="primary")],
+             data=f"o:user_notes:{user_id}".encode(), style="primary")],
         [btn(f"🗑️ Remove User",
-             data=f"o:user_del:{user_id}".encode(),
-             style="danger")],
+             data=f"o:user_del:{user_id}".encode(), style="danger")],
         [btn("🔙 Back", data=b"o:users", style="primary")],
     ]
 
@@ -3221,15 +3063,13 @@ def kb_owner_user_channels(user_id, page=0):
         st = "🟢" if ch[8] else "🔴"
         rows.append([
             btn(f"{st} {ch_title} — {cnt}/post",
-                data=f"o:ch:{cid}".encode(),
-                style="primary")
+                data=f"o:ch:{cid}".encode(), style="primary")
         ])
 
     if not page_chs:
         rows.append([
             btn("❌ No channels",
-                data=f"o:user_add_ch:{user_id}".encode(),
-                style="danger")
+                data=f"o:user_add_ch:{user_id}".encode(), style="danger")
         ])
 
     nav = []
@@ -3246,18 +3086,15 @@ def kb_owner_user_channels(user_id, page=0):
 
     rows.append([
         btn("➕ Add Channel",
-            data=f"o:user_add_ch:{user_id}".encode(),
-            style="success")
+            data=f"o:user_add_ch:{user_id}".encode(), style="success")
     ])
     rows.append([
-        btn("🔙 Back", data=f"o:user:{user_id}".encode(),
-            style="primary")
+        btn("🔙 Back", data=f"o:user:{user_id}".encode(), style="primary")
     ])
 
     return rows
 
 
-# ══════════════════════ CHANNELS MANAGEMENT ══════════════════════
 def kb_owner_channels(page=0):
     channels = db_list_channels()
     per_page = 8
@@ -3275,8 +3112,7 @@ def kb_owner_channels(page=0):
         st = "🟢" if ch[8] else "🔴"
         rows.append([
             btn(f"{st} {ch_title} — {cnt} | u:{user_id}",
-                data=f"o:ch:{cid}".encode(),
-                style="primary")
+                data=f"o:ch:{cid}".encode(), style="primary")
         ])
 
     if not page_chs:
@@ -3287,12 +3123,10 @@ def kb_owner_channels(page=0):
     nav = []
     if page > 0:
         nav.append(btn("⬅️ Prev",
-                       data=f"o:channels:{page - 1}".encode(),
-                       style="primary"))
+                       data=f"o:channels:{page - 1}".encode(), style="primary"))
     if page < total_pages - 1:
         nav.append(btn("Next ➡️",
-                       data=f"o:channels:{page + 1}".encode(),
-                       style="primary"))
+                       data=f"o:channels:{page + 1}".encode(), style="primary"))
     if nav:
         rows.append(nav)
 
@@ -3300,9 +3134,7 @@ def kb_owner_channels(page=0):
         btn(f"📄 {page + 1}/{total_pages}",
             data=f"o:channels:{page}".encode(), style="success")
     ])
-    rows.append([
-        btn("🔙 Back", data=b"o:home", style="primary")
-    ])
+    rows.append([btn("🔙 Back", data=b"o:home", style="primary")])
 
     return rows
 
@@ -3320,26 +3152,19 @@ def kb_owner_channel_detail(channel_id):
              data=f"o:ch_toggle:{channel_id}".encode(),
              style="success" if is_act else "danger")],
         [btn(f"✏️ Count: {ch[5]}",
-             data=f"o:ch_count:{channel_id}".encode(),
-             style="primary")],
+             data=f"o:ch_count:{channel_id}".encode(), style="primary")],
         [btn(f"✏️ Emoji: {ch[6]}",
-             data=f"o:ch_emoji:{channel_id}".encode(),
-             style="primary")],
+             data=f"o:ch_emoji:{channel_id}".encode(), style="primary")],
         [btn(f"✏️ Change Link",
-             data=f"o:ch_link:{channel_id}".encode(),
-             style="primary")],
+             data=f"o:ch_link:{channel_id}".encode(), style="primary")],
         [btn(f"🔄 {'Re-join' if joined else 'Join Now'}",
-             data=f"o:ch_rejoin:{channel_id}".encode(),
-             style="success")],
+             data=f"o:ch_rejoin:{channel_id}".encode(), style="success")],
         [btn("📜 History",
-             data=f"o:ch_hist:{channel_id}".encode(),
-             style="primary"),
+             data=f"o:ch_hist:{channel_id}".encode(), style="primary"),
          btn("🧪 Test Now",
-             data=f"o:ch_test:{channel_id}".encode(),
-             style="success")],
+             data=f"o:ch_test:{channel_id}".encode(), style="success")],
         [btn("🗑️ Remove Channel",
-             data=f"o:ch_del:{channel_id}".encode(),
-             style="danger")],
+             data=f"o:ch_del:{channel_id}".encode(), style="danger")],
         [btn("🔙 Back", data=b"o:channels", style="primary")],
     ]
 
@@ -3347,15 +3172,12 @@ def kb_owner_channel_detail(channel_id):
 def kb_owner_channel_history(channel_id):
     return [
         [btn("🔄 Refresh",
-             data=f"o:ch_hist:{channel_id}".encode(),
-             style="success")],
+             data=f"o:ch_hist:{channel_id}".encode(), style="success")],
         [btn("🔙 Back",
-             data=f"o:ch:{channel_id}".encode(),
-             style="primary")],
+             data=f"o:ch:{channel_id}".encode(), style="primary")],
     ]
 
 
-# ══════════════════════ SESSIONS MANAGEMENT ══════════════════════
 def kb_owner_sessions():
     status = get_sessions_status()
 
@@ -3368,18 +3190,12 @@ def kb_owner_sessions():
              data=b"o:sessions_clear", style="danger"),
          btn(f"💾 Loaded: {status['loaded']}",
              data=b"o:sessions", style="primary")],
-        [btn("📋 View All Sessions", data=b"o:sessions_list",
-             style="primary")],
-        [btn("🌊 Clear All Floods", data=b"o:sessions_clear",
-             style="danger")],
-        [btn("🔌 Disconnect All", data=b"o:sessions_disconnect",
-             style="danger")],
-        [btn("🧪 Test Sessions", data=b"o:sessions_test",
-             style="success")],
-        [btn("📥 Reload Sessions", data=b"o:sessions_reload",
-             style="success")],
-        [btn("🧹 Cleanup Now", data=b"o:sessions_cleanup",
-             style="danger")],
+        [btn("📋 View All Sessions", data=b"o:sessions_list", style="primary")],
+        [btn("🌊 Clear All Floods", data=b"o:sessions_clear", style="danger")],
+        [btn("🔌 Disconnect All", data=b"o:sessions_disconnect", style="danger")],
+        [btn("🧪 Test Sessions", data=b"o:sessions_test", style="success")],
+        [btn("📥 Reload Sessions", data=b"o:sessions_reload", style="success")],
+        [btn("🧹 Cleanup Now", data=b"o:sessions_cleanup", style="danger")],
         [btn("🔙 Back", data=b"o:home", style="primary")],
     ]
 
@@ -3404,8 +3220,7 @@ def kb_owner_sessions_list(page=0):
 
     if not page_sess:
         rows.append([
-            btn("❌ No sessions found", data=b"o:sessions",
-                style="danger")
+            btn("❌ No sessions found", data=b"o:sessions", style="danger")
         ])
 
     nav = []
@@ -3422,12 +3237,9 @@ def kb_owner_sessions_list(page=0):
 
     rows.append([
         btn(f"📄 {page + 1}/{total_pages}",
-            data=f"o:sessions_list:{page}".encode(),
-            style="success")
+            data=f"o:sessions_list:{page}".encode(), style="success")
     ])
-    rows.append([
-        btn("🔙 Back", data=b"o:sessions", style="primary")
-    ])
+    rows.append([btn("🔙 Back", data=b"o:sessions", style="primary")])
 
     return rows
 
@@ -3443,45 +3255,34 @@ def kb_owner_session_info(sf):
         flood_txt = f"{remaining}s" if remaining > 0 else "expired"
 
     return [
-        [btn(f"📁 {sf[:30]}", data=b"o:sessions",
-             style="primary")],
+        [btn(f"📁 {sf[:30]}", data=b"o:sessions", style="primary")],
         [btn(f"🌊 Flooded: {'✅' if flooded else '❌'}",
              data=f"o:sess_flood:{sf}".encode(),
              style="danger" if flooded else "success")],
         [btn(f"💾 Loaded: {'✅' if loaded else '❌'}",
-             data=f"o:sess_load:{sf}".encode(),
-             style="primary")],
+             data=f"o:sess_load:{sf}".encode(), style="primary")],
         [btn(f"⏱️ Flood till: {flood_txt}",
              data=b"o:sessions", style="primary")],
         [btn("🧪 Test",
-             data=f"o:sess_test:{sf}".encode(),
-             style="success"),
+             data=f"o:sess_test:{sf}".encode(), style="success"),
          btn("🔄 Reset Flood",
-             data=f"o:sess_reset:{sf}".encode(),
-             style="primary")],
+             data=f"o:sess_reset:{sf}".encode(), style="primary")],
         [btn("🔌 Disconnect",
-             data=f"o:sess_disc:{sf}".encode(),
-             style="danger")],
+             data=f"o:sess_disc:{sf}".encode(), style="danger")],
         [btn("🔙 Back", data=b"o:sessions_list", style="primary")],
     ]
 
 
-# ══════════════════════ ANALYTICS ══════════════════════
 def kb_owner_analytics():
     return [
-        [btn("📜 Recent Reactions", data=b"o:recent",
-             style="primary")],
-        [btn("📊 Today Stats", data=b"o:analytics_today",
-             style="success")],
-        [btn("🏆 Top Users", data=b"o:top_users",
-             style="primary")],
-        [btn("📢 Top Channels", data=b"o:top_channels",
-             style="primary")],
+        [btn("📜 Recent Reactions", data=b"o:recent", style="primary")],
+        [btn("📊 Today Stats", data=b"o:analytics_today", style="success")],
+        [btn("🏆 Top Users", data=b"o:top_users", style="primary")],
+        [btn("📢 Top Channels", data=b"o:top_channels", style="primary")],
         [btn("🔙 Back", data=b"o:home", style="primary")],
     ]
 
 
-# ══════════════════════ SETTINGS ══════════════════════
 def kb_owner_settings():
     def yn(v):
         return "✅" if v else "❌"
@@ -3491,11 +3292,9 @@ def kb_owner_settings():
 
     return [
         [btn(f"{yn(multi_lang)} Multi-Language",
-             data=b"o:toggle:multi_lang_enabled",
-             style="primary")],
+             data=b"o:toggle:multi_lang_enabled", style="primary")],
         [btn(f"{yn(notify_default)} Default Notify",
-             data=b"o:toggle:notify_user_default",
-             style="success")],
+             data=b"o:toggle:notify_user_default", style="success")],
         [btn("✏️ Change Owner Username",
              data=b"o:edit_uname", style="primary")],
         [btn("✏️ Change Owner ID",
@@ -3507,41 +3306,34 @@ def kb_owner_settings():
 def kb_confirm_delete_user(user_id):
     return [
         [btn("⚠️ YES, Remove",
-             data=f"o:user_del_confirm:{user_id}".encode(),
-             style="danger")],
+             data=f"o:user_del_confirm:{user_id}".encode(), style="danger")],
         [btn("❌ Cancel",
-             data=f"o:user:{user_id}".encode(),
-             style="primary")],
+             data=f"o:user:{user_id}".encode(), style="primary")],
     ]
 
 
 def kb_confirm_delete_channel(channel_id):
     return [
         [btn("⚠️ YES, Remove",
-             data=f"o:ch_del_confirm:{channel_id}".encode(),
-             style="danger")],
+             data=f"o:ch_del_confirm:{channel_id}".encode(), style="danger")],
         [btn("❌ Cancel",
-             data=f"o:ch:{channel_id}".encode(),
-             style="primary")],
+             data=f"o:ch:{channel_id}".encode(), style="primary")],
     ]
 
 
 def kb_owner_broadcast():
     return [
-        [btn("👥 To All Users", data=b"o:bc_users",
-             style="primary")],
-        [btn("💎 To Active Users", data=b"o:bc_active",
-             style="success")],
+        [btn("👥 To All Users", data=b"o:bc_users", style="primary")],
+        [btn("💎 To Active Users", data=b"o:bc_active", style="success")],
         [btn("🔙 Cancel", data=b"o:home", style="danger")],
     ]
 
 
 def kb_owner_notifications():
     return [
-        [btn("📤 Send to User", data=b"o:notif_user",
-             style="primary")],
-        [btn("📢 Broadcast Notification", data=b"o:notif_broadcast",
-             style="success")],
+        [btn("📤 Send to User", data=b"o:notif_user", style="primary")],
+        [btn("📢 Broadcast Notification",
+             data=b"o:notif_broadcast", style="success")],
         [btn("🔙 Back", data=b"o:home", style="primary")],
     ]
 
@@ -3855,12 +3647,10 @@ async def on_msg(event):
         if not text:
             return
 
-        # OWNER states
         if OWNER_IS(uid) and uid in USER_STATES:
             await handle_owner_state(event, uid, text)
             return
 
-        # USER states (owner bhi user ban sakta hai)
         if uid in USER_STATES:
             await handle_user_state(event, uid, text)
             return
@@ -3881,7 +3671,6 @@ async def on_msg(event):
 
 # ══════════════════════ OWNER STATE HANDLER ══════════════════════
 async def handle_owner_state(event, uid, text):
-    """Handle owner input flows"""
     state = USER_STATES.get(uid, {})
     step = state.get("step")
 
@@ -3952,9 +3741,8 @@ async def handle_owner_state(event, uid, text):
                              style="primary")],
                     ])
             else:
-                await event.reply(
-                    f"❌ Failed: {result}",
-                    buttons=kb_owner_back())
+                await event.reply(f"❌ Failed: {result}",
+                                  buttons=kb_owner_back())
             return
 
         # ── Add Channel (owner adds for user) ──
@@ -4058,8 +3846,7 @@ async def handle_owner_state(event, uid, text):
             USER_STATES[uid] = state
             await event.reply(
                 f"✅ Emojis: {len(emojis)}\n\n"
-                f"{' '.join(emojis[:20])}\n\n"
-                f"➡️ Confirm?",
+                f"{' '.join(emojis[:20])}\n\n➡️ Confirm?",
                 buttons=[
                     [btn("✅ Confirm", data=b"o:confirm_add_ch",
                          style="success")],
@@ -4069,7 +3856,6 @@ async def handle_owner_state(event, uid, text):
                 ])
             return
 
-        # ── Edit Count ──
         if step == "edit_ch_count":
             cnt = parse_reaction_count(text)
             if not cnt:
@@ -4177,14 +3963,12 @@ async def handle_owner_state(event, uid, text):
                               buttons=kb_owner_settings())
             return
 
-        # ── Broadcast ──
         if step == "broadcast_msg":
             target_type = state.get("broadcast_type", "users")
             del USER_STATES[uid]
             await perform_broadcast(event, uid, text, target_type)
             return
 
-        # ── Notify Single User ──
         if step == "notify_user_id":
             target = parse_user_input_id(text)
             if not target:
@@ -4195,8 +3979,7 @@ async def handle_owner_state(event, uid, text):
             state["step"] = "notify_user_msg"
             USER_STATES[uid] = state
             await event.reply(
-                f"📤 **Send message to `{target}`**\n\n"
-                f"➡️ Type message:",
+                f"📤 **Send message to `{target}`**\n\n➡️ Type message:",
                 buttons=kb_owner_back())
             return
 
@@ -4219,17 +4002,14 @@ async def handle_owner_state(event, uid, text):
                     buttons=kb_owner_back())
             return
 
-        # ══════════════════════════════════════════
-        # QUICK REACTION FLOWS
-        # ══════════════════════════════════════════
+        # ── Quick Reaction flows ──
         if step == "quick_react_link":
             link = text.strip()
 
             if "/" not in link:
                 await event.reply(
                     f"❌ **Invalid link**\n\n"
-                    f"**Example:**\n"
-                    f"`https://t.me/channel/123`",
+                    f"**Example:**\n`https://t.me/channel/123`",
                     buttons=kb_owner_back())
                 return
 
@@ -4258,20 +4038,13 @@ async def handle_owner_state(event, uid, text):
                 f"🔗 `{link}`\n\n"
                 f"➡️ Kitne reactions? (1-100)",
                 buttons=[
-                    [btn("5", data=b"o:qr_count:5",
-                         style="primary"),
-                     btn("10", data=b"o:qr_count:10",
-                         style="primary"),
-                     btn("20", data=b"o:qr_count:20",
-                         style="primary")],
-                    [btn("30", data=b"o:qr_count:30",
-                         style="primary"),
-                     btn("50", data=b"o:qr_count:50",
-                         style="primary"),
-                     btn("100", data=b"o:qr_count:100",
-                         style="primary")],
-                    [btn("🔙 Cancel", data=b"o:home",
-                         style="danger")],
+                    [btn("5", data=b"o:qr_count:5", style="primary"),
+                     btn("10", data=b"o:qr_count:10", style="primary"),
+                     btn("20", data=b"o:qr_count:20", style="primary")],
+                    [btn("30", data=b"o:qr_count:30", style="primary"),
+                     btn("50", data=b"o:qr_count:50", style="primary"),
+                     btn("100", data=b"o:qr_count:100", style="primary")],
+                    [btn("🔙 Cancel", data=b"o:home", style="danger")],
                 ])
             return
 
@@ -4291,8 +4064,7 @@ async def handle_owner_state(event, uid, text):
                          style="success")],
                     [btn("✏️ Custom", data=b"o:qr_emoji:custom",
                          style="primary")],
-                    [btn("🔙 Cancel", data=b"o:home",
-                         style="danger")],
+                    [btn("🔙 Cancel", data=b"o:home", style="danger")],
                 ])
             return
 
@@ -4308,8 +4080,7 @@ async def handle_owner_state(event, uid, text):
             USER_STATES[uid] = state
             await event.reply(
                 f"✅ Emojis: {len(emojis)}\n\n"
-                f"{' '.join(emojis[:20])}\n\n"
-                f"➡️ Confirm?",
+                f"{' '.join(emojis[:20])}\n\n➡️ Confirm?",
                 buttons=[
                     [btn("✅ SEND NOW", data=b"o:qr_send",
                          style="success")],
@@ -4318,7 +4089,6 @@ async def handle_owner_state(event, uid, text):
                 ])
             return
 
-        # Fallback
         del USER_STATES[uid]
         await event.reply("❌ Session expired",
                           buttons=kb_owner_back())
@@ -4330,12 +4100,10 @@ async def handle_owner_state(event, uid, text):
 
 # ══════════════════════ USER STATE HANDLER ══════════════════════
 async def handle_user_state(event, uid, text):
-    """Handle user input flows — including owner as user"""
     state = USER_STATES.get(uid, {})
     step = state.get("step")
 
     try:
-        # ── User Add Channel: Link ──
         if step == "user_add_channel_link":
             link = text.strip()
             if not (link.startswith("@") or "t.me/" in link
@@ -4356,16 +4124,14 @@ async def handle_user_state(event, uid, text):
 
             if not cid:
                 await event.reply(
-                    f"❌ **Chat not found**\n\n"
-                    f"Try @username or numeric ID",
+                    f"❌ **Chat not found**\n\nTry @username or numeric ID",
                     buttons=kb_user_back())
                 return
 
             if db_channel_already_exists(uid, cid):
                 del USER_STATES[uid]
                 await event.reply(
-                    f"⚠️ **Already added**\n\n"
-                    f"📢 {title}\n🆔 `{cid}`",
+                    f"⚠️ **Already added**\n\n📢 {title}\n🆔 `{cid}`",
                     buttons=kb_user_channels(uid))
                 return
 
@@ -4387,8 +4153,7 @@ async def handle_user_state(event, uid, text):
                     [btn("30", data=b"u:qc:30", style="primary"),
                      btn("50", data=b"u:qc:50", style="primary"),
                      btn("100", data=b"u:qc:100", style="primary")],
-                    [btn("🔙 Cancel", data=b"u:home",
-                         style="danger")],
+                    [btn("🔙 Cancel", data=b"u:home", style="danger")],
                 ])
             return
 
@@ -4408,8 +4173,7 @@ async def handle_user_state(event, uid, text):
                          style="success")],
                     [btn("✏️ Custom", data=b"u:qe:custom",
                          style="primary")],
-                    [btn("🔙 Cancel", data=b"u:home",
-                         style="danger")],
+                    [btn("🔙 Cancel", data=b"u:home", style="danger")],
                 ])
             return
 
@@ -4428,8 +4192,7 @@ async def handle_user_state(event, uid, text):
                 buttons=[
                     [btn("✅ Confirm", data=b"u:confirm_add_ch",
                          style="success")],
-                    [btn("❌ Cancel", data=b"u:home",
-                         style="danger")],
+                    [btn("❌ Cancel", data=b"u:home", style="danger")],
                 ])
             return
 
@@ -4448,8 +4211,7 @@ async def handle_user_state(event, uid, text):
             await event.reply(
                 f"✅ Count updated: **{cnt}**",
                 buttons=[[btn("🔙 Back",
-                    data=f"u:ch:{cid}".encode(),
-                    style="primary")]])
+                    data=f"u:ch:{cid}".encode(), style="primary")]])
             return
 
         if step == "user_edit_ch_emojis":
@@ -4468,8 +4230,7 @@ async def handle_user_state(event, uid, text):
             await event.reply(
                 f"✅ Emojis updated",
                 buttons=[[btn("🔙 Back",
-                    data=f"u:ch:{cid}".encode(),
-                    style="primary")]])
+                    data=f"u:ch:{cid}".encode(), style="primary")]])
             return
 
         if step == "user_edit_ch_link":
@@ -4499,8 +4260,7 @@ async def handle_user_state(event, uid, text):
                          data=f"u:ch_rejoin:{ch_id}".encode(),
                          style="success")],
                     [btn("🔙 Back",
-                         data=f"u:ch:{ch_id}".encode(),
-                         style="primary")]])
+                         data=f"u:ch:{ch_id}".encode(), style="primary")]])
             return
 
         del USER_STATES[uid]
@@ -4617,22 +4377,19 @@ async def handle_user_cb(event, uid, data):
     try:
         if data == "u:home":
             await safe_answer(event, "🏠")
-            await safe_edit(event,
-                get_welcome_message(uid),
+            await safe_edit(event, get_welcome_message(uid),
                 buttons=kb_user_home(uid))
             return
 
         if data == "u:settings":
             await safe_answer(event, "📊")
-            await safe_edit(event,
-                get_settings_message(uid),
+            await safe_edit(event, get_settings_message(uid),
                 buttons=kb_user_settings(uid))
             return
 
         if data == "u:channels":
             await safe_answer(event, "📢")
-            await safe_edit(event,
-                build_user_channels_text(uid),
+            await safe_edit(event, build_user_channels_text(uid),
                 buttons=kb_user_channels(uid))
             return
 
@@ -4640,7 +4397,6 @@ async def handle_user_cb(event, uid, data):
             await safe_answer(event, "📢 +more", alert=True)
             return
 
-        # ── Add Channel ──
         if data == "u:add_ch":
             USER_STATES[uid] = {"step": "user_add_channel_link"}
             await safe_answer(event, "➕")
@@ -4656,7 +4412,6 @@ async def handle_user_cb(event, uid, data):
                               style="danger")]])
             return
 
-        # ── Quick Count ──
         if data.startswith("u:qc:"):
             try:
                 cnt = int(data.split(":")[2])
@@ -4677,12 +4432,10 @@ async def handle_user_cb(event, uid, data):
                          style="success")],
                     [btn("✏️ Custom", data=b"u:qe:custom",
                          style="primary")],
-                    [btn("🔙 Cancel", data=b"u:home",
-                         style="danger")],
+                    [btn("🔙 Cancel", data=b"u:home", style="danger")],
                 ])
             return
 
-        # ── Emoji Mode ──
         if data == "u:qe:default":
             state = USER_STATES.get(uid, {})
             if state.get("step") != "user_add_channel_emoji":
@@ -4698,8 +4451,7 @@ async def handle_user_cb(event, uid, data):
                 buttons=[
                     [btn("✅ Confirm", data=b"u:confirm_add_ch",
                          style="success")],
-                    [btn("❌ Cancel", data=b"u:home",
-                         style="danger")],
+                    [btn("❌ Cancel", data=b"u:home", style="danger")],
                 ])
             return
 
@@ -4719,7 +4471,6 @@ async def handle_user_cb(event, uid, data):
                               style="danger")]])
             return
 
-        # ── Confirm Add Channel ──
         if data == "u:confirm_add_ch":
             state = USER_STATES.get(uid, {})
             if state.get("step") != "user_add_channel_confirm":
@@ -4748,8 +4499,7 @@ async def handle_user_cb(event, uid, data):
                     buttons=[
                         [btn("📢 My Channels",
                              data=b"u:channels", style="success")],
-                        [btn("🏠 Home", data=b"u:home",
-                             style="primary")]
+                        [btn("🏠 Home", data=b"u:home", style="primary")]
                     ])
             except Exception as e:
                 await safe_answer(event, "❌ Failed", alert=True)
@@ -4758,7 +4508,6 @@ async def handle_user_cb(event, uid, data):
                     buttons=kb_user_back())
             return
 
-        # ── Channel Detail ──
         if data.startswith("u:ch:"):
             try:
                 cid = int(data.split(":")[2])
@@ -4794,7 +4543,6 @@ async def handle_user_cb(event, uid, data):
                 buttons=kb_user_channel_history(uid, cid))
             return
 
-        # ── Edit Count ──
         if data.startswith("u:ch_count:"):
             try:
                 cid = int(data.split(":")[2])
@@ -4806,11 +4554,9 @@ async def handle_user_cb(event, uid, data):
             await safe_edit(event,
                 f"✏️ **Edit Count**\n\n➡️ New count (1-100):",
                 buttons=[[btn("🔙 Cancel",
-                    data=f"u:ch:{cid}".encode(),
-                    style="danger")]])
+                    data=f"u:ch:{cid}".encode(), style="danger")]])
             return
 
-        # ── Edit Emojis ──
         if data.startswith("u:ch_emoji:"):
             try:
                 cid = int(data.split(":")[2])
@@ -4820,14 +4566,11 @@ async def handle_user_cb(event, uid, data):
                                 "channel_id": cid}
             await safe_answer(event, "✏️")
             await safe_edit(event,
-                f"✏️ **Edit Emojis**\n\n"
-                f"➡️ Send emojis (space/comma):",
+                f"✏️ **Edit Emojis**\n\n➡️ Send emojis (space/comma):",
                 buttons=[[btn("🔙 Cancel",
-                    data=f"u:ch:{cid}".encode(),
-                    style="danger")]])
+                    data=f"u:ch:{cid}".encode(), style="danger")]])
             return
 
-        # ── Edit Link ──
         if data.startswith("u:ch_link:"):
             try:
                 cid = int(data.split(":")[2])
@@ -4839,11 +4582,9 @@ async def handle_user_cb(event, uid, data):
             await safe_edit(event,
                 f"🔗 **Edit Link**\n\n➡️ Send new chat link:",
                 buttons=[[btn("🔙 Cancel",
-                    data=f"u:ch:{cid}".encode(),
-                    style="danger")]])
+                    data=f"u:ch:{cid}".encode(), style="danger")]])
             return
 
-        # ── Re-join ──
         if data.startswith("u:ch_rejoin:"):
             try:
                 cid = int(data.split(":")[2])
@@ -4861,8 +4602,7 @@ async def handle_user_cb(event, uid, data):
                 if j + a > 0:
                     db_update_channel(cid, joined=1)
                     await safe_edit(event,
-                        f"✅ **Joined!**\n\n"
-                        f"🆕 {j} | ⚡ {a} | ❌ {f}",
+                        f"✅ **Joined!**\n\n🆕 {j} | ⚡ {a} | ❌ {f}",
                         buttons=kb_user_channel_detail(uid, cid))
                 else:
                     await safe_edit(event,
@@ -4874,7 +4614,6 @@ async def handle_user_cb(event, uid, data):
                     buttons=kb_user_channel_detail(uid, cid))
             return
 
-        # ── Delete Channel ──
         if data.startswith("u:ch_del:"):
             try:
                 cid = int(data.split(":")[2])
@@ -4884,12 +4623,11 @@ async def handle_user_cb(event, uid, data):
             await safe_edit(event,
                 f"⚠️ **Confirm Remove**\n\n🆔 `{cid}`",
                 buttons=[
-                    [btn("🗑️ YES", 
+                    [btn("🗑️ YES",
                          data=f"u:ch_del_confirm:{cid}".encode(),
                          style="danger")],
                     [btn("❌ Cancel",
-                         data=f"u:ch:{cid}".encode(),
-                         style="primary")]])
+                         data=f"u:ch:{cid}".encode(), style="primary")]])
             return
 
         if data.startswith("u:ch_del_confirm:"):
@@ -4903,15 +4641,12 @@ async def handle_user_cb(event, uid, data):
                 buttons=kb_user_channels(uid))
             return
 
-        # ── History ──
         if data == "u:history":
             await safe_answer(event, "📜")
-            await safe_edit(event,
-                build_user_history_text(uid),
+            await safe_edit(event, build_user_history_text(uid),
                 buttons=kb_user_history(uid))
             return
 
-        # ── Language ──
         if data == "u:language":
             await safe_answer(event, "🌍")
             await safe_edit(event,
@@ -4931,18 +4666,14 @@ async def handle_user_cb(event, uid, data):
                 buttons=kb_user_home(uid))
             return
 
-        # ── Toggle Notifications ──
         if data == "u:toggle_notify":
             new_state = db_toggle_user_notify(uid)
             await safe_answer(event,
-                f"{'✅ ON' if new_state else '❌ OFF'}",
-                alert=True)
-            await safe_edit(event,
-                get_welcome_message(uid),
+                f"{'✅ ON' if new_state else '❌ OFF'}", alert=True)
+            await safe_edit(event, get_welcome_message(uid),
                 buttons=kb_user_home(uid))
             return
 
-        # ── Notifications ──
         if data == "u:notif":
             notifs = db_get_notifications(uid, 10)
             txt = f"{STAR_LINE}\n🔔 **Notifications**\n{STAR_LINE}\n\n"
@@ -4964,18 +4695,15 @@ async def handle_user_cb(event, uid, data):
                 buttons=kb_user_notifications(uid))
             return
 
-        # ── Help ──
         if data == "u:help":
             await safe_answer(event, "❓")
-            await safe_edit(event,
-                get_help_text(uid),
+            await safe_edit(event, get_help_text(uid),
                 buttons=kb_user_help(uid))
             return
 
         if data == "u:info_nochannels":
             await safe_answer(event,
-                "ℹ️ Contact owner to add channels",
-                alert=True)
+                "ℹ️ Contact owner to add channels", alert=True)
             return
 
         await safe_answer(event, "⚠️ Unknown", alert=True)
@@ -5011,21 +4739,17 @@ async def handle_denied_cb(event, uid, data):
 
 # ══════════════════════ OWNER CALLBACKS ══════════════════════
 async def handle_owner_cb(event, uid, data):
-    """Owner callbacks"""
     try:
-        # ═════ MAIN ═════
         if data == "o:home":
             await safe_answer(event, "👑")
-            await safe_edit(event,
-                get_owner_dashboard_message(),
+            await safe_edit(event, get_owner_dashboard_message(),
                 buttons=kb_owner_home())
             return
 
         # ═════ USERS ═════
         if data == "o:users":
             await safe_answer(event, "👥")
-            await safe_edit(event,
-                build_owner_users_text(0),
+            await safe_edit(event, build_owner_users_text(0),
                 buttons=kb_owner_users(0))
             return
 
@@ -5035,8 +4759,7 @@ async def handle_owner_cb(event, uid, data):
             except Exception:
                 page = 0
             await safe_answer(event, f"📄 {page + 1}")
-            await safe_edit(event,
-                build_owner_users_text(page),
+            await safe_edit(event, build_owner_users_text(page),
                 buttons=kb_owner_users(page))
             return
 
@@ -5063,8 +4786,7 @@ async def handle_owner_cb(event, uid, data):
                 await safe_answer(event, "❌ Not found", alert=True)
                 return
             await safe_answer(event, "👤")
-            await safe_edit(event,
-                get_owner_user_view(tuid),
+            await safe_edit(event, get_owner_user_view(tuid),
                 buttons=kb_owner_user_detail(tuid))
             return
 
@@ -5075,10 +4797,8 @@ async def handle_owner_cb(event, uid, data):
                 return
             new_state = db_toggle_user_active(tuid)
             await safe_answer(event,
-                f"{'🟢' if new_state else '🔴'}",
-                alert=True)
-            await safe_edit(event,
-                get_owner_user_view(tuid),
+                f"{'🟢' if new_state else '🔴'}", alert=True)
+            await safe_edit(event, get_owner_user_view(tuid),
                 buttons=kb_owner_user_detail(tuid))
             return
 
@@ -5089,10 +4809,8 @@ async def handle_owner_cb(event, uid, data):
                 return
             new_state = db_toggle_user_notify(tuid)
             await safe_answer(event,
-                f"{'🔔' if new_state else '🔕'}",
-                alert=True)
-            await safe_edit(event,
-                get_owner_user_view(tuid),
+                f"{'🔔' if new_state else '🔕'}", alert=True)
+            await safe_edit(event, get_owner_user_view(tuid),
                 buttons=kb_owner_user_detail(tuid))
             return
 
@@ -5122,8 +4840,7 @@ async def handle_owner_cb(event, uid, data):
                 f"👤 User: `{tuid}`\n\n"
                 f"➡️ Channel/Group link bhejo:",
                 buttons=[[btn("🔙 Cancel",
-                    data=f"o:user:{tuid}".encode(),
-                    style="danger")]])
+                    data=f"o:user:{tuid}".encode(), style="danger")]])
             return
 
         if data.startswith("o:user_notes:"):
@@ -5142,8 +4859,7 @@ async def handle_owner_cb(event, uid, data):
                 f"Current: {notes or '_No notes_'}\n\n"
                 f"➡️ New notes:",
                 buttons=[[btn("🔙 Cancel",
-                    data=f"o:user:{tuid}".encode(),
-                    style="danger")]])
+                    data=f"o:user:{tuid}".encode(), style="danger")]])
             return
 
         if data.startswith("o:user_del:"):
@@ -5166,8 +4882,7 @@ async def handle_owner_cb(event, uid, data):
                 return
             db_remove_user(tuid)
             await safe_answer(event, "🗑️", alert=True)
-            await safe_edit(event,
-                build_owner_users_text(0),
+            await safe_edit(event, build_owner_users_text(0),
                 buttons=kb_owner_users(0))
             return
 
@@ -5196,8 +4911,7 @@ async def handle_owner_cb(event, uid, data):
             except Exception:
                 return
             await safe_answer(event, "📢")
-            await safe_edit(event,
-                build_owner_channel_detail(cid),
+            await safe_edit(event, build_owner_channel_detail(cid),
                 buttons=kb_owner_channel_detail(cid))
             return
 
@@ -5208,10 +4922,8 @@ async def handle_owner_cb(event, uid, data):
                 return
             new_state = db_toggle_channel(cid)
             await safe_answer(event,
-                f"{'🟢' if new_state else '🔴'}",
-                alert=True)
-            await safe_edit(event,
-                build_owner_channel_detail(cid),
+                f"{'🟢' if new_state else '🔴'}", alert=True)
+            await safe_edit(event, build_owner_channel_detail(cid),
                 buttons=kb_owner_channel_detail(cid))
             return
 
@@ -5220,14 +4932,12 @@ async def handle_owner_cb(event, uid, data):
                 cid = int(data.split(":")[2])
             except Exception:
                 return
-            USER_STATES[uid] = {"step": "edit_ch_count",
-                                "channel_id": cid}
+            USER_STATES[uid] = {"step": "edit_ch_count", "channel_id": cid}
             await safe_answer(event, "✏️")
             await safe_edit(event,
                 f"✏️ **Edit Count**\n\n➡️ New count (1-100):",
                 buttons=[[btn("🔙 Cancel",
-                    data=f"o:ch:{cid}".encode(),
-                    style="danger")]])
+                    data=f"o:ch:{cid}".encode(), style="danger")]])
             return
 
         if data.startswith("o:qc:"):
@@ -5261,15 +4971,12 @@ async def handle_owner_cb(event, uid, data):
                 cid = int(data.split(":")[2])
             except Exception:
                 return
-            USER_STATES[uid] = {"step": "edit_ch_emojis",
-                                "channel_id": cid}
+            USER_STATES[uid] = {"step": "edit_ch_emojis", "channel_id": cid}
             await safe_answer(event, "✏️")
             await safe_edit(event,
-                f"✏️ **Edit Emojis**\n\n"
-                f"➡️ Send emojis (space/comma):",
+                f"✏️ **Edit Emojis**\n\n➡️ Send emojis (space/comma):",
                 buttons=[[btn("🔙 Cancel",
-                    data=f"o:ch:{cid}".encode(),
-                    style="danger")]])
+                    data=f"o:ch:{cid}".encode(), style="danger")]])
             return
 
         if data.startswith("o:ch_link:"):
@@ -5277,14 +4984,12 @@ async def handle_owner_cb(event, uid, data):
                 cid = int(data.split(":")[2])
             except Exception:
                 return
-            USER_STATES[uid] = {"step": "edit_ch_link",
-                                "channel_id": cid}
+            USER_STATES[uid] = {"step": "edit_ch_link", "channel_id": cid}
             await safe_answer(event, "🔗")
             await safe_edit(event,
                 f"🔗 **Edit Link**\n\n➡️ Send new chat link:",
                 buttons=[[btn("🔙 Cancel",
-                    data=f"o:ch:{cid}".encode(),
-                    style="danger")]])
+                    data=f"o:ch:{cid}".encode(), style="danger")]])
             return
 
         if data == "o:qe:default":
@@ -5383,8 +5088,7 @@ async def handle_owner_cb(event, uid, data):
                 if j + a > 0:
                     db_update_channel(cid, joined=1)
                     await safe_edit(event,
-                        f"✅ **Joined!**\n\n"
-                        f"🆕 {j} | ⚡ {a} | ❌ {f}",
+                        f"✅ **Joined!**\n\n🆕 {j} | ⚡ {a} | ❌ {f}",
                         buttons=kb_owner_channel_detail(cid))
                 else:
                     await safe_edit(event,
@@ -5463,8 +5167,7 @@ async def handle_owner_cb(event, uid, data):
         # ═════ SESSIONS ═════
         if data == "o:sessions":
             await safe_answer(event, "🔐")
-            await safe_edit(event,
-                _build_sessions_overview(),
+            await safe_edit(event, _build_sessions_overview(),
                 buttons=kb_owner_sessions())
             return
 
@@ -5487,8 +5190,7 @@ async def handle_owner_cb(event, uid, data):
         if data.startswith("o:sess_info:"):
             sf = data[len("o:sess_info:"):]
             await safe_answer(event, "📁")
-            await safe_edit(event,
-                _build_session_detail(sf),
+            await safe_edit(event, _build_session_detail(sf),
                 buttons=kb_owner_session_info(sf))
             return
 
@@ -5521,8 +5223,7 @@ async def handle_owner_cb(event, uid, data):
             sf = data[len("o:sess_reset:"):]
             REAL_FLOOD_UNTIL.pop(sf, None)
             await safe_answer(event, "🔄", alert=True)
-            await safe_edit(event,
-                f"✅ Flood reset",
+            await safe_edit(event, "✅ Flood reset",
                 buttons=kb_owner_session_info(sf))
             return
 
@@ -5535,8 +5236,7 @@ async def handle_owner_cb(event, uid, data):
                 except Exception:
                     pass
             await safe_answer(event, "🔌", alert=True)
-            await safe_edit(event,
-                f"✅ Disconnected",
+            await safe_edit(event, "✅ Disconnected",
                 buttons=kb_owner_session_info(sf))
             return
 
@@ -5544,8 +5244,7 @@ async def handle_owner_cb(event, uid, data):
             n = len(REAL_FLOOD_UNTIL)
             REAL_FLOOD_UNTIL.clear()
             await safe_answer(event, f"🌊 {n}", alert=True)
-            await safe_edit(event,
-                _build_sessions_overview(),
+            await safe_edit(event, _build_sessions_overview(),
                 buttons=kb_owner_sessions())
             return
 
@@ -5553,8 +5252,7 @@ async def handle_owner_cb(event, uid, data):
             n = len(REAL_CLIENTS)
             await close_all_real_clients()
             await safe_answer(event, f"🔌 {n}", alert=True)
-            await safe_edit(event,
-                _build_sessions_overview(),
+            await safe_edit(event, _build_sessions_overview(),
                 buttons=kb_owner_sessions())
             return
 
@@ -5597,8 +5295,7 @@ async def handle_owner_cb(event, uid, data):
 
         if data == "o:sessions_reload":
             await safe_answer(event, "📥", alert=True)
-            await safe_edit(event,
-                _build_sessions_overview(),
+            await safe_edit(event, _build_sessions_overview(),
                 buttons=kb_owner_sessions())
             return
 
@@ -5613,8 +5310,7 @@ async def handle_owner_cb(event, uid, data):
         # ═════ ANALYTICS ═════
         if data == "o:analytics":
             await safe_answer(event, "📊")
-            await safe_edit(event,
-                build_owner_analytics_text(),
+            await safe_edit(event, build_owner_analytics_text(),
                 buttons=kb_owner_analytics())
             return
 
@@ -5625,26 +5321,22 @@ async def handle_owner_cb(event, uid, data):
 
         if data == "o:recent":
             await safe_answer(event, "📜")
-            await safe_edit(event,
-                build_owner_recent_text(),
+            await safe_edit(event, build_owner_recent_text(),
                 buttons=kb_owner_analytics())
             return
 
         if data == "o:top_users":
             await safe_answer(event, "🏆")
-            await safe_edit(event,
-                build_owner_top_users_text(),
+            await safe_edit(event, build_owner_top_users_text(),
                 buttons=kb_owner_analytics())
             return
 
         if data == "o:top_channels":
             await safe_answer(event, "📢")
-            await safe_edit(event,
-                build_owner_top_channels_text(),
+            await safe_edit(event, build_owner_top_channels_text(),
                 buttons=kb_owner_analytics())
             return
 
-        # ═════ RUN CHECK ═════
         if data == "o:run_check":
             if TASK_RUNNING:
                 await safe_answer(event, "⏳ Already running", alert=True)
@@ -5694,8 +5386,7 @@ async def handle_owner_cb(event, uid, data):
                          style="success")],
                     [btn("✏️ Custom", data=b"o:qr_emoji:custom",
                          style="primary")],
-                    [btn("🔙 Cancel", data=b"o:home",
-                         style="danger")],
+                    [btn("🔙 Cancel", data=b"o:home", style="danger")],
                 ])
             return
 
@@ -5752,8 +5443,7 @@ async def handle_owner_cb(event, uid, data):
                 f"🔗 `{link}`\n\n⏳ Please wait...")
 
             ok, fail, total, err = await send_reactions_to_link(
-                link, count=cnt, emoji_mode=mode,
-                custom_emojis=emojis)
+                link, count=cnt, emoji_mode=mode, custom_emojis=emojis)
 
             del USER_STATES[uid]
 
@@ -5781,8 +5471,7 @@ async def handle_owner_cb(event, uid, data):
                 buttons=[
                     [btn("⚡ Again", data=b"o:quick_react",
                          style="success")],
-                    [btn("🔙 Home", data=b"o:home",
-                         style="primary")],
+                    [btn("🔙 Home", data=b"o:home", style="primary")],
                 ])
             return
 
@@ -5859,8 +5548,7 @@ async def handle_owner_cb(event, uid, data):
         # ═════ NOTIFICATIONS ═════
         if data == "o:notifications":
             await safe_answer(event, "📋")
-            await safe_edit(event,
-                f"📋 **Notification Tools**",
+            await safe_edit(event, "📋 **Notification Tools**",
                 buttons=kb_owner_notifications())
             return
 
@@ -5951,7 +5639,6 @@ async def _manual_check_now():
 
 # ══════════════════════ MANUAL CLEANUP ══════════════════════
 async def _manual_cleanup_sessions():
-    """Run one cleanup cycle immediately"""
     try:
         sessions = discover_sessions()
         removed = 0
@@ -5982,7 +5669,6 @@ async def _manual_cleanup_sessions():
                             pass
                         REAL_CLIENTS.pop(sf, None)
                     removed += 1
-                    DBG(f"🗑️ Removed: {sf}", "clean")
                 else:
                     try:
                         await asyncio.wait_for(client.get_me(), timeout=8)
@@ -6080,7 +5766,7 @@ async def main():
     print("╔" + "═" * 58 + "╗", flush=True)
     print("║" + " " * 14 + "👻  GHOST AUTO-REACTOR" + " " * 21 + "║",
           flush=True)
-    print("║" + " " * 18 + "Whitelist Edition v3.0" + " " * 17 + "║",
+    print("║" + " " * 18 + "Whitelist Edition v4.0" + " " * 17 + "║",
           flush=True)
     print("╚" + "═" * 58 + "╝", flush=True)
     print("", flush=True)
@@ -6089,15 +5775,12 @@ async def main():
     db_init()
     DBG("Database ready", "ok")
 
-    # ✅ OWNER ko bhi user bana do
     DBG("Ensuring owner is whitelisted as user...", "db")
     try:
         owner_u = db_get_user(get_owner_id())
         if not owner_u:
             ok, res = db_add_user(
-                get_owner_id(),
-                OWNER_USERNAME_DEFAULT,
-                "Owner",
+                get_owner_id(), OWNER_USERNAME_DEFAULT, "Owner",
                 added_by=get_owner_id())
             DBG(f"Owner added as user: {res}", "ok")
         else:
