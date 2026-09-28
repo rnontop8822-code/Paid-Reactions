@@ -1469,8 +1469,6 @@ def get_help_text(uid=None):
     )
 
 
-# ══════════════════════ END OF PART 3 ══════════════════════
-print("[STARTUP] Part 3 loaded (Languages + Templates)", flush=True)
 # ══════════════════════ SESSION MANAGER ══════════════════════
 async def get_real_client(sf):
     """
@@ -1890,8 +1888,8 @@ def get_newest_post_id(msgs):
         return 0
 
 
-# ══════════════════════ END OF PART 4 ══════════════════════
-print("[STARTUP] Part 4 loaded (Session Manager + Reactions)", flush=True)
+# ══════════════════════ END OF PART 3 ══════════════════════
+print("[STARTUP] Part 3 loaded (Languages + Templates + Sessions)", flush=True)
 # ══════════════════════ USER VALIDATION ══════════════════════
 def is_admin(uid):
     """Check if user is owner/admin"""
@@ -2189,8 +2187,6 @@ def can_send_reactions():
     return count_available_sessions() > 0
 
 
-# ══════════════════════ END OF PART 5 ══════════════════════
-print("[STARTUP] Part 5 loaded (Checks + Helpers)", flush=True)
 # ══════════════════════ BACKGROUND WORKER — MAIN LOOP ══════════════════════
 async def auto_watch_loop():
     """
@@ -2485,7 +2481,7 @@ async def health_loop():
             pass
 
 
-# ══════════════════════ DAILY SUMMARY LOOP ══════════════════════
+# ══════════════════════ ✅ FIXED: DAILY SUMMARY LOOP ══════════════════════
 async def daily_summary_loop():
     """Send daily summary to owner"""
     last_sent = None
@@ -2498,6 +2494,10 @@ async def daily_summary_loop():
             if cur == DAILY_SUMMARY_TIME and last_sent != today:
                 last_sent = today
                 await send_daily_summary()
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            DBG(f"Daily summary loop error: {str(e)[:80]}", "warn")
 
 
 # ══════════════════════ SEND DAILY SUMMARY ══════════════════════
@@ -2574,8 +2574,6 @@ async def session_health_check():
             DBG(f"Session health error: {str(e)[:80]}", "warn")
 
 
-# ══════════════════════ END OF PART 6 ══════════════════════
-print("[STARTUP] Part 6 loaded (Background Worker)", flush=True)
 # ══════════════════════ USER KEYBOARDS ══════════════════════
 def kb_user_home(uid):
     """Main home keyboard for whitelisted user"""
@@ -2835,8 +2833,6 @@ def build_user_history_text(uid):
     return txt
 
 
-# ══════════════════════ END OF PART 7 ══════════════════════
-print("[STARTUP] Part 7 loaded (User Keyboards)", flush=True)
 # ══════════════════════ OWNER MAIN PANEL ══════════════════════
 def kb_owner_home():
     """Owner main dashboard"""
@@ -3499,8 +3495,6 @@ def build_owner_top_channels_text():
     return txt
 
 
-# ══════════════════════ END OF PART 8 ══════════════════════
-print("[STARTUP] Part 8 loaded (Owner Keyboards)", flush=True)
 # ══════════════════════ /start COMMAND ══════════════════════
 @bot.on(events.NewMessage(pattern="/start"))
 async def on_start(event):
@@ -3533,10 +3527,9 @@ async def on_start(event):
 
         # Whitelisted user → User Panel
         if db_is_whitelisted(uid):
-            # Make sure user record exists (in case owner added via ID before user /start)
+            # Make sure user record exists
             u = db_get_user(uid)
             if not u:
-                # Whitelisted via username but no record — add minimal
                 db_add_user(uid, un, fn, added_by=get_owner_id())
 
             await event.reply(
@@ -3649,10 +3642,6 @@ async def on_msg(event):
         if OWNER_IS(uid) and uid in USER_STATES:
             await handle_owner_state(event, uid, text)
             return
-
-        # ═════ USER FLOWS (not needed — user is view-only) ═════
-        # Whitelisted users don't have input flows
-        # Non-whitelisted users don't have input flows either
 
         # Default: guide to /start
         if OWNER_IS(uid):
@@ -4090,8 +4079,6 @@ async def perform_broadcast(event, uid, message, target_type):
         D_err(e, "perform_broadcast")
 
 
-# ══════════════════════ END OF PART 9 ══════════════════════
-print("[STARTUP] Part 9 loaded (/start + Handler + Flows)", flush=True)
 # ══════════════════════ CALLBACK HANDLER ══════════════════════
 @bot.on(events.CallbackQuery)
 async def on_cb(event):
@@ -4143,7 +4130,7 @@ async def on_cb(event):
             pass
 
 
-# ══════════════════════ USER CALLBACKS (View-Only) ══════════════════════
+# ══════════════════════ USER CALLBACKS ══════════════════════
 async def handle_user_cb(event, uid, data):
     """User callbacks — view-only navigation"""
     try:
@@ -5228,8 +5215,6 @@ async def _manual_check_now():
         D_err(e, "_manual_check_now")
 
 
-# ══════════════════════ END OF PART 10 ══════════════════════
-print("[STARTUP] Part 10 loaded (Callbacks)", flush=True)
 # ══════════════════════ HTTP HEALTH SERVER ══════════════════════
 async def start_health_server():
     """Simple HTTP server for uptime monitoring"""
@@ -5321,9 +5306,7 @@ async def main():
     TASK_USER_ID = None
     DBG("State cleared", "db")
 
-    # ═════ Admin Client (optional — for entity resolution) ═════
-    # Note: This bot does NOT require admin_client; sessions handle everything.
-    # But we may load one for chat resolution if ADMIN_SESSION provided.
+    # ═════ Admin Client (optional) ═════
     admin_session = os.getenv("ADMIN_SESSION", "")
     if admin_session and len(admin_session) > 100:
         try:
@@ -5351,7 +5334,7 @@ async def main():
     else:
         print(f"  ✅ Sessions loaded: {len(sessions)}", flush=True)
 
-    # ═════ Auto-download sessions from GitHub (if enabled) ═════
+    # ═════ Auto-download sessions from GitHub ═════
     if HAS_GH_SYNC and github_sync.is_enabled():
         try:
             DBG("Downloading sessions from GitHub...", "sync")
@@ -5390,7 +5373,7 @@ async def main():
     tasks.append(asyncio.create_task(health_loop()))
     DBG("Health check loop task", "ok")
 
-    # Daily summary loop
+    # ✅ FIXED: Daily summary loop
     tasks.append(asyncio.create_task(daily_summary_loop()))
     DBG("Daily summary loop task", "ok")
 
