@@ -1,15 +1,16 @@
 """
 ============================================================
-   GHOST AUTO-REACTOR v4.0
+   GHOST AUTO-REACTOR v5.0
    Whitelist-Based Multi-Channel Auto-Reaction Bot
    Real Sessions Only • Auto-Join • Per-User Config
-   + Auto-Cleanup Expired Sessions
+   + Auto-Cleanup Expired/Duplicated Sessions
    + @username Support
    + Full Order Notifications
    + Owner as User
    + Quick Reaction (post link)
-   + Smart Emoji Fallback (invalid emoji → try another from pool)
-   + Session Retry (failed session → next session until count done)
+   + Smart Emoji Fallback
+   + Session Retry (failed session → next session)
+   + AuthKeyDuplicated → AUTO-DELETE (banned sessions skip)
    Credit: @Anonymous_User_37
 ============================================================
 """
@@ -37,7 +38,7 @@ except ImportError:
 from telethon.errors import FloodWaitError
 from telethon.errors.rpcerrorlist import (
     MessageIdInvalidError, MessageNotModifiedError,
-    UserAlreadyParticipantError)
+    UserAlreadyParticipantError, AuthKeyDuplicatedError)
 
 from aiohttp import web
 
@@ -90,7 +91,6 @@ SESSION_AUTO_CLEANUP_INTERVAL = 1800  # 30 min
 
 # ══════════════════════ REACTIONS ══════════════════════
 DEFAULT_REACTIONS = ["❤️", "👍", "🔥"]
-
 FALLBACK_REACTIONS = ["❤️", "👍", "🔥", "🥰", "🎉", "💯", "😍", "👏"]
 
 ALL_REACTIONS = [
@@ -127,6 +127,7 @@ bot = TelegramClient("ghost_auto_bot", API_ID, API_HASH)
 REAL_CLIENTS = {}
 REAL_CLIENT_LOCK = asyncio.Lock()
 REAL_FLOOD_UNTIL = {}
+BANNED_SESSIONS = set()       # ✅ NEW: Session names jo AuthKeyDuplicated hain
 
 TASK_RUNNING = False
 TASK_USER_ID = None
@@ -163,7 +164,7 @@ def DBG(msg, level="info"):
         "info": "🔍", "ok": "✅", "fail": "❌", "warn": "⚠️",
         "api": "🌐", "react": "💫", "join": "🚪", "sync": "🔄",
         "db": "💾", "flood": "🌊", "watch": "📡", "task": "🎯",
-        "clean": "🧹"
+        "clean": "🧹", "ban": "🚫"
     }
     print(f"[{ts}] {ic.get(level, '•')} [DBG] {msg}", flush=True)
 
@@ -183,6 +184,52 @@ def sanitize_title(title, limit=60):
         return "Unknown"
     t = str(title).replace("\n", " ").replace("\r", " ").replace("\t", " ")
     return t[:limit]
+
+
+def is_banned_session(sf):
+    """Check if session is marked as banned"""
+    return sf in BANNED_SESSIONS
+
+
+def mark_session_banned(sf, reason=""):
+    """Mark session as banned + delete file"""
+    BANNED_SESSIONS.add(sf)
+    try:
+        path = os.path.join(SESSIONS_DIR, sf.replace(".session", ""))
+        session_file = path + ".session"
+        if os.path.exists(session_file):
+            os.remove(session_file)
+            journal = session_file + "-journal"
+            if os.path.exists(journal):
+                os.remove(journal)
+            DBG(f"🚫 Deleted banned session: {sf} ({reason})", "ban")
+    except Exception as e:
+        DBG(f"Delete fail {sf}: {str(e)[:60]}", "warn")
+    # Remove from RAM
+    if sf in REAL_CLIENTS:
+        try:
+            REAL_CLIENTS.pop(sf, None)
+        except Exception:
+            pass
+
+
+def is_auth_error(err_str):
+    """Check if error is AuthKeyDuplicated or similar"""
+    if not err_str:
+        return False
+    keywords = [
+        "AuthKeyDuplicated",
+        "used under two different",
+        "authorization key",
+        "AuthKeyUnregistered",
+        "SessionRevoked",
+        "UserDeactivated",
+        "SessionExpired",
+    ]
+    for kw in keywords:
+        if kw in err_str:
+            return True
+    return False
 
 
 # ══════════════════════ CONFIG HELPERS ══════════════════════
@@ -229,13 +276,17 @@ def OWNER_IS(uid):
 
 # ══════════════════════ SESSION HELPERS ══════════════════════
 def discover_sessions():
+    """Find all .session files (excluding banned)"""
     if not os.path.isdir(SESSIONS_DIR):
         return []
     try:
-        return sorted([
+        files = [
             f for f in os.listdir(SESSIONS_DIR)
             if f.endswith(".session")
-        ])
+        ]
+        # Filter banned
+        files = [f for f in files if f not in BANNED_SESSIONS]
+        return sorted(files)
     except Exception:
         return []
 
@@ -255,11 +306,13 @@ def mark_session_flooded(sf, sec):
 
 
 def count_available_sessions():
-    return sum(1 for f in discover_sessions() if not is_session_flooded(f))
+    return sum(1 for f in discover_sessions()
+               if not is_session_flooded(f))
 
 
 def count_flooded_sessions():
-    return sum(1 for f in discover_sessions() if is_session_flooded(f))
+    return sum(1 for f in discover_sessions()
+               if is_session_flooded(f))
 
 
 def get_sessions_status():
@@ -269,6 +322,7 @@ def get_sessions_status():
         "available": len(files) - count_flooded_sessions(),
         "flooded": count_flooded_sessions(),
         "loaded": len(REAL_CLIENTS),
+        "banned": len(BANNED_SESSIONS),
         "files": files
     }
 
@@ -338,6 +392,12 @@ def db_init():
         is_read INTEGER DEFAULT 0,
         created_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
 
+    # ✅ NEW: Banned sessions log
+    c.execute("""CREATE TABLE IF NOT EXISTS banned_sessions (
+        filename TEXT PRIMARY KEY,
+        reason TEXT,
+        banned_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
+
     try:
         c.execute("PRAGMA journal_mode=WAL")
         c.execute("PRAGMA synchronous=NORMAL")
@@ -369,8 +429,31 @@ def db_init():
         c.execute("INSERT OR IGNORE INTO config(key, value) VALUES(?, ?)", (k, v))
 
     conn.commit()
+
+    # ✅ Load banned sessions into RAM
+    try:
+        rows = conn.execute("SELECT filename FROM banned_sessions").fetchall()
+        for r in rows:
+            BANNED_SESSIONS.add(r[0])
+    except Exception:
+        pass
+
     conn.close()
-    DBG("Database initialized", "db")
+    DBG(f"Database initialized (banned loaded: {len(BANNED_SESSIONS)})", "db")
+
+
+def db_add_banned_session(sf, reason=""):
+    """Log banned session to DB"""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        try:
+            conn.execute("""INSERT OR REPLACE INTO banned_sessions
+                (filename, reason) VALUES (?, ?)""", (sf, reason[:200]))
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        pass
 
 
 def cfg_bool(k, d=True):
@@ -1256,6 +1339,10 @@ def get_owner_dashboard_message():
     today_reactions = db_reactions_today()
     sessions = get_sessions_status()
 
+    banned_line = ""
+    if sessions.get("banned", 0) > 0:
+        banned_line = f"   Banned: **{sessions['banned']}**\n"
+
     return (
         f"{STAR_LINE}\n"
         f"👑 **OWNER DASHBOARD**\n"
@@ -1273,7 +1360,8 @@ def get_owner_dashboard_message():
         f"   Total: **{sessions['total']}**\n"
         f"   Available: **{sessions['available']}**\n"
         f"   Flooded: **{sessions['flooded']}**\n"
-        f"   Loaded: **{sessions['loaded']}**\n\n"
+        f"   Loaded: **{sessions['loaded']}**\n"
+        f"{banned_line}\n"
         f"⏱️ Uptime: {int(time.time() - _start_time)}s"
     )
 
@@ -1344,7 +1432,17 @@ def get_help_text(uid=None):
 
 # ══════════════════════ SESSION MANAGER ══════════════════════
 async def get_real_client(sf):
+    """
+    Get or create a real client from .session file.
+    - Skips banned sessions
+    - Handles AuthKeyDuplicated → auto-delete
+    """
+    # ✅ Skip if banned
+    if is_banned_session(sf):
+        return None
+
     async with REAL_CLIENT_LOCK:
+        # MAX_CLIENTS limit
         if len(REAL_CLIENTS) >= MAX_CLIENTS:
             to_remove = list(REAL_CLIENTS.keys())[
                 :max(1, len(REAL_CLIENTS) - MAX_CLIENTS + 1)]
@@ -1356,6 +1454,7 @@ async def get_real_client(sf):
                 REAL_CLIENTS.pop(k, None)
                 DBG(f"Client evicted (RAM limit): {k}", "warn")
 
+        # Return cached
         if sf in REAL_CLIENTS:
             c = REAL_CLIENTS[sf]
             try:
@@ -1369,6 +1468,7 @@ async def get_real_client(sf):
                 pass
             REAL_CLIENTS.pop(sf, None)
 
+        # Create new
         path = os.path.join(SESSIONS_DIR, sf.replace(".session", ""))
         if not os.path.exists(path + ".session"):
             DBG(f"Session file not found: {sf}", "warn")
@@ -1377,15 +1477,46 @@ async def get_real_client(sf):
         try:
             client = TelegramClient(path, API_ID, API_HASH)
             await asyncio.wait_for(client.connect(), timeout=25)
+
             if not await client.is_user_authorized():
                 await client.disconnect()
-                DBG(f"Session not authorized: {sf}", "warn")
+                # Not authorized → mark banned (logged out)
+                mark_session_banned(sf, "not_authorized")
+                db_add_banned_session(sf, "not_authorized")
                 return None
+
             REAL_CLIENTS[sf] = client
             DBG(f"Session loaded: {sf}", "ok")
             return client
+
+        except AuthKeyDuplicatedError as e:
+            # ✅ AuthKeyDuplicated → auto-delete
+            try:
+                if 'client' in locals() and client:
+                    await client.disconnect()
+            except Exception:
+                pass
+            mark_session_banned(sf, "authkey_duplicated")
+            db_add_banned_session(sf, "authkey_duplicated")
+            DBG(f"🚫 BANNED (duplicated): {sf}", "ban")
+            return None
+
         except Exception as e:
-            DBG(f"Session load fail {sf}: {str(e)[:80]}", "fail")
+            err_str = str(e)
+            DBG(f"Session load fail {sf}: {err_str[:80]}", "fail")
+
+            # ✅ Check if auth error
+            if is_auth_error(err_str):
+                try:
+                    if 'client' in locals() and client:
+                        await client.disconnect()
+                except Exception:
+                    pass
+                mark_session_banned(sf, "auth_error")
+                db_add_banned_session(sf, err_str[:100])
+                DBG(f"🚫 BANNED (auth): {sf}", "ban")
+                return None
+
             return None
 
 
@@ -1403,6 +1534,8 @@ async def close_all_real_clients():
 async def session_join_chat(sf, chat_ref, invite_hash=None):
     if is_session_flooded(sf):
         return False, "flooded"
+    if is_banned_session(sf):
+        return False, "banned"
 
     client = await get_real_client(sf)
     if not client:
@@ -1418,6 +1551,10 @@ async def session_join_chat(sf, chat_ref, invite_hash=None):
                 return True, "joined"
             except UserAlreadyParticipantError:
                 return True, "already"
+            except AuthKeyDuplicatedError:
+                mark_session_banned(sf, "authkey_duplicated")
+                db_add_banned_session(sf, "authkey_duplicated")
+                return False, "banned"
             except Exception as e:
                 return False, str(e)[:80]
 
@@ -1425,6 +1562,10 @@ async def session_join_chat(sf, chat_ref, invite_hash=None):
             entity = await asyncio.wait_for(
                 client.get_entity(chat_ref),
                 timeout=REAL_ENTITY_TIMEOUT)
+        except AuthKeyDuplicatedError:
+            mark_session_banned(sf, "authkey_duplicated")
+            db_add_banned_session(sf, "authkey_duplicated")
+            return False, "banned"
         except Exception as e:
             return False, f"resolve: {str(e)[:60]}"
 
@@ -1448,6 +1589,10 @@ async def session_join_chat(sf, chat_ref, invite_hash=None):
         except FloodWaitError as e:
             mark_session_flooded(sf, e.seconds + 10)
             return False, f"flood:{e.seconds}"
+        except AuthKeyDuplicatedError:
+            mark_session_banned(sf, "authkey_duplicated")
+            db_add_banned_session(sf, "authkey_duplicated")
+            return False, "banned"
         except Exception as e:
             return False, f"join: {str(e)[:60]}"
     except Exception as e:
@@ -1464,7 +1609,8 @@ async def join_chat_with_sessions(chat_link, chat_id=None,
     if not sessions:
         return 0, 0, 0
 
-    available = [s for s in sessions if not is_session_flooded(s)]
+    available = [s for s in sessions
+                 if not is_session_flooded(s) and not is_banned_session(s)]
     if not available:
         return 0, 0, 0
 
@@ -1514,17 +1660,18 @@ def parse_chat_link(link):
     return link, None
 
 
-# ══════════════════════ ✅ SMART EMOJI FALLBACK ══════════════════════
+# ══════════════════════ SMART EMOJI FALLBACK ══════════════════════
 async def session_send_reaction(sf, chat_ref, msg_id, emoji,
                                  emoji_pool=None):
     """
     Send a reaction from a session.
-    SMART: Agar user ka emoji invalid ho to USI POOL se doosra try karo
-    Jab tak koi emoji lage ya sab try ho jayein.
-    Returns (ok, used_emoji, error)
+    - Invalid emoji → next from pool
+    - AuthKeyDuplicated → mark banned + return fail
     """
     if is_session_flooded(sf):
         return False, emoji, "flooded"
+    if is_banned_session(sf):
+        return False, emoji, "banned"
 
     client = await get_real_client(sf)
     if not client:
@@ -1534,21 +1681,23 @@ async def session_send_reaction(sf, chat_ref, msg_id, emoji,
         entity = await asyncio.wait_for(
             client.get_entity(chat_ref),
             timeout=REAL_ENTITY_TIMEOUT)
+    except AuthKeyDuplicatedError:
+        mark_session_banned(sf, "authkey_duplicated")
+        db_add_banned_session(sf, "authkey_duplicated")
+        return False, emoji, "banned"
     except Exception as e:
         return False, emoji, f"resolve: {str(e)[:60]}"
 
-    # ── Build fallback list (user's pool first, then shuffle) ──
+    # Build fallback list
     if emoji_pool and len(emoji_pool) > 0:
         fb_pool = list(emoji_pool)
     else:
         fb_pool = FALLBACK_REACTIONS.copy()
 
     random.shuffle(fb_pool)
-
-    # Pehle user ka emoji, phir baaki pool
     try_list = [emoji] + [e for e in fb_pool if e != emoji]
 
-    # ── Try each emoji until one works ──
+    # Try each emoji
     last_err = ""
     for try_emoji in try_list:
         try:
@@ -1567,36 +1716,39 @@ async def session_send_reaction(sf, chat_ref, msg_id, emoji,
             mark_session_flooded(sf, e.seconds + 10)
             return False, emoji, f"flood:{e.seconds}"
 
+        except AuthKeyDuplicatedError:
+            mark_session_banned(sf, "authkey_duplicated")
+            db_add_banned_session(sf, "authkey_duplicated")
+            return False, emoji, "banned"
+
         except Exception as e:
             err_str = str(e)
             last_err = err_str[:80]
 
-            # Sirf invalid emoji pe next try karo
+            # Auth error check
+            if is_auth_error(err_str):
+                mark_session_banned(sf, "auth_error")
+                db_add_banned_session(sf, err_str[:100])
+                return False, emoji, "banned"
+
+            # Invalid emoji → try next
             if ("Invalid reaction" in err_str or
                 "only emoji" in err_str or
                 "REACTION_INVALID" in err_str):
                 DBG(f"↻ {sf}: {try_emoji} invalid, trying next", "react")
                 continue
 
-            # Baaki errors (chat restricted, etc.) — stop
             return False, emoji, last_err
 
-    # Saare emojis try kiye, koi nahi laga
     return False, emoji, f"all_emojis_failed: {last_err[:60]}"
 
 
-# ══════════════════════ ✅ SEND REACTIONS (WITH RETRY) ══════════════════════
+# ══════════════════════ SEND REACTIONS (WITH RETRY) ══════════════════════
 async def send_reactions_from_sessions(chat_link, msg_id, count,
                                         emoji_mode="default",
                                         custom_emojis=None,
                                         on_progress=None):
-    """
-    Send N reactions using multiple sessions.
-    - Failed session → next session try
-    - Invalid emoji → next emoji from pool
-    - Full count poora karne ki koshish
-    """
-    result = {"ok": 0, "fail": 0, "flooded": 0, "total": 0}
+    result = {"ok": 0, "fail": 0, "flooded": 0, "banned": 0, "total": 0}
 
     if count <= 0:
         return result
@@ -1608,9 +1760,10 @@ async def send_reactions_from_sessions(chat_link, msg_id, count,
         DBG("No sessions available", "warn")
         return result
 
-    available = [s for s in sessions if not is_session_flooded(s)]
+    available = [s for s in sessions
+                 if not is_session_flooded(s) and not is_banned_session(s)]
     if not available:
-        DBG("All sessions flooded", "flood")
+        DBG("All sessions flooded/banned", "flood")
         return result
 
     random.shuffle(available)
@@ -1618,14 +1771,14 @@ async def send_reactions_from_sessions(chat_link, msg_id, count,
 
     DBG(f"Sending {count} reactions to {chat_link} #{msg_id}", "react")
 
-    # ── Build emoji pool ──
+    # Emoji pool
     if emoji_mode == "custom" and custom_emojis:
         valid = [e for e in custom_emojis if e in ALL_REACTIONS]
         base_pool = valid if valid else FALLBACK_REACTIONS.copy()
     else:
         base_pool = DEFAULT_REACTIONS.copy()
 
-    # Full emoji plan (user's emojis first, then repeat from pool)
+    # Full emoji plan
     full_emojis = []
     full_emojis.extend(base_pool)
     while len(full_emojis) < count:
@@ -1634,11 +1787,12 @@ async def send_reactions_from_sessions(chat_link, msg_id, count,
 
     DBG(f"Emoji plan ({len(full_emojis)}): {full_emojis[:15]}...", "react")
 
-    # ── Try sessions until count reached ──
+    # Try sessions
     tried_sessions = set()
     ok_count = 0
     fail_count = 0
     flood_count = 0
+    ban_count = 0
 
     max_attempts = len(available) * 3
     attempts = 0
@@ -1657,16 +1811,17 @@ async def send_reactions_from_sessions(chat_link, msg_id, count,
         if is_session_flooded(sf):
             flood_count += 1
             continue
+        if is_banned_session(sf):
+            ban_count += 1
+            continue
 
-        # Pick emoji
         if ok_count < len(full_emojis):
             emoji = full_emojis[ok_count]
         else:
             emoji = random.choice(base_pool)
 
         success, used_emoji, err = await session_send_reaction(
-            sf, chat_ref, msg_id, emoji,
-            emoji_pool=base_pool)
+            sf, chat_ref, msg_id, emoji, emoji_pool=base_pool)
 
         if success:
             ok_count += 1
@@ -1675,6 +1830,9 @@ async def send_reactions_from_sessions(chat_link, msg_id, count,
             DBG(f"✅ {sf}: {used_emoji} ({ok_count}/{count})", "react")
         elif "flood" in err:
             flood_count += 1
+        elif "banned" in err:
+            ban_count += 1
+            tried_sessions.add(sf)
         else:
             fail_count += 1
             DBG(f"❌ {sf}: {err[:60]}", "fail")
@@ -1689,9 +1847,10 @@ async def send_reactions_from_sessions(chat_link, msg_id, count,
 
     result["fail"] = fail_count
     result["flooded"] = flood_count
+    result["banned"] = ban_count
 
     DBG(f"Reactions done: ✅{ok_count}/{count} ❌{fail_count} "
-        f"🌊{flood_count}", "react")
+        f"🌊{flood_count} 🚫{ban_count}", "react")
 
     return result
 
@@ -1712,7 +1871,7 @@ async def verify_post_exists(chat_ref, msg_id, invite_hash=None):
             pass
 
     for sf in discover_sessions()[:3]:
-        if is_session_flooded(sf):
+        if is_session_flooded(sf) or is_banned_session(sf):
             continue
         try:
             client = await get_real_client(sf)
@@ -1747,7 +1906,7 @@ async def get_latest_posts(chat_id, limit=5):
             pass
 
     for sf in discover_sessions()[:5]:
-        if is_session_flooded(sf):
+        if is_session_flooded(sf) or is_banned_session(sf):
             continue
         try:
             client = await get_real_client(sf)
@@ -1892,7 +2051,7 @@ async def safe_get_entity(ref, cache_key=None, cache_store=None):
             pass
 
     for sf in discover_sessions()[:5]:
-        if is_session_flooded(sf):
+        if is_session_flooded(sf) or is_banned_session(sf):
             continue
         try:
             client = await get_real_client(sf)
@@ -1905,6 +2064,10 @@ async def safe_get_entity(ref, cache_key=None, cache_store=None):
                 entity, now + timedelta(seconds=ENTITY_CACHE_TTL))
             DBG(f"Resolved via {sf}: {ref}", "ok")
             return entity
+        except AuthKeyDuplicatedError:
+            mark_session_banned(sf, "authkey_duplicated")
+            db_add_banned_session(sf, "authkey_duplicated")
+            continue
         except Exception:
             continue
 
@@ -1920,7 +2083,7 @@ async def resolve_username_to_id(username):
         return None, None, None
 
     for sf in discover_sessions()[:10]:
-        if is_session_flooded(sf):
+        if is_session_flooded(sf) or is_banned_session(sf):
             continue
         try:
             client = await get_real_client(sf)
@@ -1936,6 +2099,10 @@ async def resolve_username_to_id(username):
                     getattr(ent, "first_name", None),
                     getattr(ent, "username", username)
                 )
+        except AuthKeyDuplicatedError:
+            mark_session_banned(sf, "authkey_duplicated")
+            db_add_banned_session(sf, "authkey_duplicated")
+            continue
         except Exception:
             continue
     return None, None, None
@@ -1959,26 +2126,6 @@ async def resolve_chat_info(chat_link):
     except Exception as e:
         DBG(f"Resolve chat info failed: {str(e)[:80]}", "fail")
         return None, None, None, invite_hash
-
-
-# ══════════════════════ CHECK SESSION ACCESS ══════════════════════
-async def check_session_access(chat_ref, invite_hash=None):
-    accessible = 0
-    sessions = discover_sessions()[:5]
-    for sf in sessions:
-        if is_session_flooded(sf):
-            continue
-        try:
-            client = await get_real_client(sf)
-            if not client:
-                continue
-            await asyncio.wait_for(
-                client.get_entity(chat_ref),
-                timeout=REAL_ENTITY_TIMEOUT)
-            accessible += 1
-        except Exception:
-            continue
-    return accessible
 
 
 # ══════════════════════ TASK LOCK ══════════════════════
@@ -2070,8 +2217,8 @@ def can_send_reactions():
 
 
 # ══════════════════════ END OF PART 2 ══════════════════════
-print("[STARTUP] Part 2 loaded (Languages + Templates + Smart Sessions)", flush=True)
-   # ══════════════════════ BACKGROUND WORKER — MAIN LOOP ══════════════════════
+print("[STARTUP] Part 2 loaded (Languages + Templates + Smart Sessions + Ban Manager)", flush=True)
+# ══════════════════════ BACKGROUND WORKER — MAIN LOOP ══════════════════════
 async def auto_watch_loop():
     global TASK_RUNNING, TASK_USER_ID
 
@@ -2198,7 +2345,6 @@ async def process_channel_check(ch):
         chat_str = str(chat_id).replace("-100", "")
         post_link = f"https://t.me/c/{chat_str}/{newest}"
 
-        # ✅ Parse custom emojis properly
         ce_list = None
         if custom_emojis:
             if isinstance(custom_emojis, str):
@@ -2266,7 +2412,6 @@ async def notify_user_reactions(user_id, chat_title, post_id,
         if not notify:
             return
 
-        # Build FULL message first
         fail_count = max(0, requested - sent)
         success_rate = int((sent / requested) * 100) if requested > 0 else 0
 
@@ -2302,12 +2447,11 @@ async def notify_user_reactions(user_id, chat_title, post_id,
             f"✅ **Status:** Complete"
         )
 
-        # Short DB save
         short_msg = (f"📡 {chat_title[:40]} | "
                      f"#{post_id} | {sent}/{requested}")
         db_add_notification(user_id, short_msg)
 
-        # ✅ Try bot first, then via sessions if fails
+        # Try bot first
         sent_ok = False
         try:
             await bot.send_message(
@@ -2324,9 +2468,8 @@ async def notify_user_reactions(user_id, chat_title, post_id,
                 "warn")
 
         if not sent_ok:
-            # Fallback: via sessions
             for sf in discover_sessions()[:5]:
-                if is_session_flooded(sf):
+                if is_session_flooded(sf) or is_banned_session(sf):
                     continue
                 try:
                     client = await get_real_client(sf)
@@ -2393,6 +2536,7 @@ async def health_loop():
                 f"users={db_count_active_users()} | "
                 f"channels={db_count_active_channels()} | "
                 f"sessions={sessions['available']}/{sessions['total']} | "
+                f"banned={sessions.get('banned', 0)} | "
                 f"loaded={len(REAL_CLIENTS)} | "
                 f"task={'RUNNING' if TASK_RUNNING else 'IDLE'}", "ok")
         except asyncio.CancelledError:
@@ -2401,8 +2545,14 @@ async def health_loop():
             pass
 
 
-# ══════════════════════ AUTO-CLEANUP EXPIRED SESSIONS ══════════════════════
+# ══════════════════════ ✅ AUTO-CLEANUP SESSIONS (FIXED) ══════════════════════
 async def auto_cleanup_sessions():
+    """
+    Har 30 min: sessions check karo.
+    - AuthKeyDuplicated/expired → delete
+    - Banned → DB mein log
+    - Working → keep
+    """
     await asyncio.sleep(180)
     DBG("Auto-cleanup sessions loop started", "clean")
 
@@ -2410,18 +2560,33 @@ async def auto_cleanup_sessions():
         try:
             await asyncio.sleep(SESSION_AUTO_CLEANUP_INTERVAL)
 
-            sessions = discover_sessions()
-            if not sessions:
+            # Get ALL sessions (including banned)
+            all_files = []
+            if os.path.isdir(SESSIONS_DIR):
+                try:
+                    all_files = [
+                        f for f in os.listdir(SESSIONS_DIR)
+                        if f.endswith(".session")
+                    ]
+                except Exception:
+                    all_files = []
+
+            if not all_files:
                 continue
 
-            DBG(f"Auto-cleanup: checking {len(sessions)} sessions", "clean")
+            DBG(f"Auto-cleanup: checking {len(all_files)} sessions", "clean")
 
             removed = 0
             kept = 0
             errors = 0
+            banned_new = 0
             removed_names = []
 
-            for sf in sessions:
+            for sf in all_files:
+                # Skip if already banned (file already gone)
+                if sf in BANNED_SESSIONS:
+                    continue
+
                 try:
                     path = os.path.join(SESSIONS_DIR,
                                         sf.replace(".session", ""))
@@ -2440,6 +2605,7 @@ async def auto_cleanup_sessions():
                             client.is_user_authorized(), timeout=10)
 
                         if not authorized:
+                            # ❌ Expired / not authorized → DELETE
                             await client.disconnect()
                             try:
                                 os.remove(session_file)
@@ -2454,16 +2620,55 @@ async def auto_cleanup_sessions():
                                 except Exception:
                                     pass
                                 REAL_CLIENTS.pop(sf, None)
+                            BANNED_SESSIONS.add(sf)
+                            db_add_banned_session(sf, "not_authorized")
                             removed += 1
+                            banned_new += 1
                             removed_names.append(sf)
                             DBG(f"🗑️ Removed expired: {sf}", "clean")
-                        else:
+                            continue
+
+                        # ✅ Authorized — try get_me
+                        try:
+                            await asyncio.wait_for(
+                                client.get_me(), timeout=8)
+                            kept += 1
+                            await client.disconnect()
+                        except AuthKeyDuplicatedError as e:
+                            # 🚫 AuthKeyDuplicated → DELETE
                             try:
-                                await asyncio.wait_for(
-                                    client.get_me(), timeout=8)
-                                kept += 1
-                            except Exception:
                                 await client.disconnect()
+                            except Exception:
+                                pass
+                            try:
+                                os.remove(session_file)
+                                journal = session_file + "-journal"
+                                if os.path.exists(journal):
+                                    os.remove(journal)
+                            except Exception:
+                                pass
+                            if sf in REAL_CLIENTS:
+                                try:
+                                    await REAL_CLIENTS[sf].disconnect()
+                                except Exception:
+                                    pass
+                                REAL_CLIENTS.pop(sf, None)
+                            BANNED_SESSIONS.add(sf)
+                            db_add_banned_session(sf, "authkey_duplicated")
+                            removed += 1
+                            banned_new += 1
+                            removed_names.append(sf)
+                            DBG(f"🚫 Removed duplicated: {sf}", "ban")
+                            continue
+                        except Exception as e:
+                            err_str = str(e)
+
+                            # ✅ Auth errors → DELETE
+                            if is_auth_error(err_str):
+                                try:
+                                    await client.disconnect()
+                                except Exception:
+                                    pass
                                 try:
                                     os.remove(session_file)
                                     journal = session_file + "-journal"
@@ -2477,28 +2682,97 @@ async def auto_cleanup_sessions():
                                     except Exception:
                                         pass
                                     REAL_CLIENTS.pop(sf, None)
+                                BANNED_SESSIONS.add(sf)
+                                db_add_banned_session(sf, "auth_error")
                                 removed += 1
+                                banned_new += 1
                                 removed_names.append(sf)
-                                DBG(f"🗑️ Removed banned: {sf}", "clean")
+                                DBG(f"🚫 Removed banned: {sf}", "ban")
                                 continue
+                            else:
+                                # Other error → keep
+                                kept += 1
+                                try:
+                                    await client.disconnect()
+                                except Exception:
+                                    pass
 
-                            await client.disconnect()
-                    except Exception as e:
-                        errors += 1
-                        DBG(f"Cleanup check fail {sf}: {str(e)[:60]}",
-                            "warn")
+                    except AuthKeyDuplicatedError:
+                        # 🚫 AuthKeyDuplicated on connect
                         if client:
                             try:
                                 await client.disconnect()
                             except Exception:
                                 pass
+                        try:
+                            os.remove(session_file)
+                            journal = session_file + "-journal"
+                            if os.path.exists(journal):
+                                os.remove(journal)
+                        except Exception:
+                            pass
+                        if sf in REAL_CLIENTS:
+                            try:
+                                await REAL_CLIENTS[sf].disconnect()
+                            except Exception:
+                                pass
+                            REAL_CLIENTS.pop(sf, None)
+                        BANNED_SESSIONS.add(sf)
+                        db_add_banned_session(sf, "authkey_duplicated")
+                        removed += 1
+                        banned_new += 1
+                        removed_names.append(sf)
+                        DBG(f"🚫 Removed duplicated: {sf}", "ban")
+                        continue
+
+                    except Exception as e:
+                        err_str = str(e)
+
+                        # ✅ Auth errors → DELETE
+                        if is_auth_error(err_str):
+                            if client:
+                                try:
+                                    await client.disconnect()
+                                except Exception:
+                                    pass
+                            try:
+                                os.remove(session_file)
+                                journal = session_file + "-journal"
+                                if os.path.exists(journal):
+                                    os.remove(journal)
+                            except Exception:
+                                pass
+                            if sf in REAL_CLIENTS:
+                                try:
+                                    await REAL_CLIENTS[sf].disconnect()
+                                except Exception:
+                                    pass
+                                REAL_CLIENTS.pop(sf, None)
+                            BANNED_SESSIONS.add(sf)
+                            db_add_banned_session(sf, err_str[:100])
+                            removed += 1
+                            banned_new += 1
+                            removed_names.append(sf)
+                            DBG(f"🚫 Removed auth-fail: {sf}", "ban")
+                        else:
+                            errors += 1
+                            DBG(f"Cleanup check fail {sf}: {err_str[:60]}",
+                                "warn")
+                            if client:
+                                try:
+                                    await client.disconnect()
+                                except Exception:
+                                    pass
+
                 except Exception as e:
                     errors += 1
                     DBG(f"Cleanup error {sf}: {str(e)[:60]}", "warn")
 
             DBG(f"Auto-cleanup done: 🗑️ removed={removed} "
-                f"✅ kept={kept} ⚠️ errors={errors}", "clean")
+                f"✅ kept={kept} ⚠️ errors={errors} "
+                f"(new bans: {banned_new})", "clean")
 
+            # Owner report
             if removed > 0:
                 try:
                     sample = ", ".join(removed_names[:5])
@@ -2510,6 +2784,7 @@ async def auto_cleanup_sessions():
                         f"🧹 **Auto-Cleanup Report**\n"
                         f"{STAR_LINE}\n\n"
                         f"🗑️ Removed: **{removed}**\n"
+                        f"🚫 New bans: **{banned_new}**\n"
                         f"✅ Kept: **{kept}**\n"
                         f"⚠️ Errors: **{errors}**\n\n"
                         f"📋 **Removed files:**\n"
@@ -2546,7 +2821,7 @@ async def send_reactions_to_link(post_link, count=10,
                 invite_hash = m.group(1)
                 msg_id = int(m.group(2))
                 for sf in discover_sessions()[:5]:
-                    if is_session_flooded(sf):
+                    if is_session_flooded(sf) or is_banned_session(sf):
                         continue
                     try:
                         client = await get_real_client(sf)
@@ -2583,9 +2858,11 @@ async def send_reactions_to_link(post_link, count=10,
         if not sessions:
             return 0, 0, 0, "No sessions available"
 
-        available = [s for s in sessions if not is_session_flooded(s)]
+        available = [s for s in sessions
+                     if not is_session_flooded(s)
+                     and not is_banned_session(s)]
         if not available:
-            return 0, 0, 0, "All sessions flooded"
+            return 0, 0, 0, "All sessions flooded/banned"
 
         random.shuffle(available)
         senders = available[:min(count, len(available))]
@@ -2600,7 +2877,7 @@ async def send_reactions_to_link(post_link, count=10,
         ok = fail = flooded = 0
 
         for sf in senders:
-            if is_session_flooded(sf):
+            if is_session_flooded(sf) or is_banned_session(sf):
                 flooded += 1
                 continue
 
@@ -2663,6 +2940,7 @@ async def send_daily_summary():
             f"   Total: **{sessions['total']}**\n"
             f"   Available: **{sessions['available']}**\n"
             f"   Flooded: **{sessions['flooded']}**\n"
+            f"   Banned: **{sessions.get('banned', 0)}**\n"
             f"   Loaded: **{sessions['loaded']}**\n\n"
             f"{DIV()}\n"
             f"📜 **Recent Activity**\n"
@@ -2693,7 +2971,7 @@ async def session_health_check():
                 continue
             sample = random.sample(sessions, min(3, len(sessions)))
             for sf in sample:
-                if is_session_flooded(sf):
+                if is_session_flooded(sf) or is_banned_session(sf):
                     continue
                 try:
                     client = await get_real_client(sf)
@@ -2703,6 +2981,10 @@ async def session_health_check():
                                 client.get_me(), timeout=8)
                             DBG(f"Session OK: {sf} → "
                                 f"{getattr(me, 'first_name', '?')}", "ok")
+                        except AuthKeyDuplicatedError:
+                            mark_session_banned(sf, "authkey_duplicated")
+                            db_add_banned_session(sf, "authkey_duplicated")
+                            DBG(f"🚫 Health banned: {sf}", "ban")
                         except Exception:
                             pass
                 except Exception:
@@ -2967,9 +3249,10 @@ def kb_owner_home():
         [btn("📋 Notifications", data=b"o:notifications", style="primary"),
          btn(f"👤 My Channels ({len(owner_channels)})",
              data=b"u:channels", style="success")],
-        [btn("⚙️ Settings", data=b"o:settings", style="primary"),
-         btn("🌍 Owner Info", data=b"o:owner_info", style="success")],
-        [btn("🔙 Main", data=b"home", style="danger")],
+        [btn("🚫 Banned Sessions", data=b"o:banned_list", style="danger"),
+         btn("⚙️ Settings", data=b"o:settings", style="primary")],
+        [btn("🌍 Owner Info", data=b"o:owner_info", style="success"),
+         btn("🔙 Main", data=b"home", style="danger")],
     ]
 
 
@@ -3188,7 +3471,9 @@ def kb_owner_sessions():
              data=b"o:sessions", style="success")],
         [btn(f"🌊 Flooded: {status['flooded']}",
              data=b"o:sessions_clear", style="danger"),
-         btn(f"💾 Loaded: {status['loaded']}",
+         btn(f"🚫 Banned: {status.get('banned', 0)}",
+             data=b"o:banned_list", style="danger")],
+        [btn(f"💾 Loaded: {status['loaded']}",
              data=b"o:sessions", style="primary")],
         [btn("📋 View All Sessions", data=b"o:sessions_list", style="primary")],
         [btn("🌊 Clear All Floods", data=b"o:sessions_clear", style="danger")],
@@ -3247,6 +3532,7 @@ def kb_owner_sessions_list(page=0):
 def kb_owner_session_info(sf):
     flooded = is_session_flooded(sf)
     loaded = sf in REAL_CLIENTS
+    banned = is_banned_session(sf)
     flood_until = REAL_FLOOD_UNTIL.get(sf)
 
     flood_txt = "—"
@@ -3256,6 +3542,9 @@ def kb_owner_session_info(sf):
 
     return [
         [btn(f"📁 {sf[:30]}", data=b"o:sessions", style="primary")],
+        [btn(f"🚫 Banned: {'✅' if banned else '❌'}",
+             data=f"o:sess_ban:{sf}".encode(),
+             style="danger" if banned else "success")],
         [btn(f"🌊 Flooded: {'✅' if flooded else '❌'}",
              data=f"o:sess_flood:{sf}".encode(),
              style="danger" if flooded else "success")],
@@ -3267,10 +3556,58 @@ def kb_owner_session_info(sf):
              data=f"o:sess_test:{sf}".encode(), style="success"),
          btn("🔄 Reset Flood",
              data=f"o:sess_reset:{sf}".encode(), style="primary")],
+        [btn("🚫 Mark Banned",
+             data=f"o:sess_ban_mark:{sf}".encode(), style="danger")],
         [btn("🔌 Disconnect",
              data=f"o:sess_disc:{sf}".encode(), style="danger")],
         [btn("🔙 Back", data=b"o:sessions_list", style="primary")],
     ]
+
+
+def kb_owner_banned_list(page=0):
+    banned = sorted(list(BANNED_SESSIONS))
+    per_page = 10
+    start = page * per_page
+    page_ban = banned[start:start + per_page]
+    total = len(banned)
+    total_pages = max(1, (total + per_page - 1) // per_page)
+
+    rows = []
+    for i, sf in enumerate(page_ban, start=start + 1):
+        rows.append([
+            btn(f"🚫 {i}. {sf[:25]}",
+                data=f"o:banned_info:{sf}".encode(), style="danger")
+        ])
+
+    if not page_ban:
+        rows.append([
+            btn("✅ No banned sessions", data=b"o:sessions",
+                style="success")
+        ])
+
+    nav = []
+    if page > 0:
+        nav.append(btn("⬅️",
+                       data=f"o:banned_list:{page - 1}".encode(),
+                       style="primary"))
+    if page < total_pages - 1:
+        nav.append(btn("➡️",
+                       data=f"o:banned_list:{page + 1}".encode(),
+                       style="primary"))
+    if nav:
+        rows.append(nav)
+
+    rows.append([
+        btn(f"📄 {page + 1}/{total_pages}",
+            data=f"o:banned_list:{page}".encode(), style="success")
+    ])
+    rows.append([
+        btn("🧹 Clear All Banned", data=b"o:banned_clear",
+             style="danger")
+    ])
+    rows.append([btn("🔙 Back", data=b"o:home", style="primary")])
+
+    return rows
 
 
 def kb_owner_analytics():
@@ -3427,6 +3764,7 @@ def build_owner_analytics_text():
         f"🔐 Sessions:\n"
         f"   Available: **{sessions['available']}/{sessions['total']}**\n"
         f"   Flooded: **{sessions['flooded']}**\n"
+        f"   Banned: **{sessions.get('banned', 0)}**\n"
         f"   Loaded: **{sessions['loaded']}**"
     )
 
@@ -3610,6 +3948,7 @@ async def on_ping(event):
             f"👥 Users: **{db_count_active_users()}**\n"
             f"📢 Channels: **{db_count_active_channels()}**\n"
             f"🔐 Sessions: **{sessions['available']}/{sessions['total']}**\n"
+            f"🚫 Banned: **{sessions.get('banned', 0)}**\n"
             f"🎯 Task: **{'🔴 RUNNING' if TASK_RUNNING else '🟢 IDLE'}**")
     except Exception as e:
         D_err(e, "on_ping")
@@ -3745,7 +4084,7 @@ async def handle_owner_state(event, uid, text):
                                   buttons=kb_owner_back())
             return
 
-        # ── Add Channel (owner adds for user) ──
+        # ── Add Channel (owner) ──
         if step == "add_channel_link":
             target_user = state.get("target_user")
             if not target_user:
@@ -4002,7 +4341,7 @@ async def handle_owner_state(event, uid, text):
                     buttons=kb_owner_back())
             return
 
-        # ── Quick Reaction flows ──
+        # Quick Reaction flows
         if step == "quick_react_link":
             link = text.strip()
 
@@ -5187,6 +5526,84 @@ async def handle_owner_cb(event, uid, data):
                 buttons=kb_owner_sessions_list(page))
             return
 
+        # ═════ BANNED LIST ═════
+        if data == "o:banned_list":
+            await safe_answer(event, "🚫")
+            await safe_edit(event,
+                f"{STAR_LINE}\n🚫 **BANNED SESSIONS**\n{STAR_LINE}\n\n"
+                f"📊 Total: **{len(BANNED_SESSIONS)}**\n\n"
+                f"Ye sessions permanently block hain\n"
+                f"(AuthKeyDuplicated / expired)",
+                buttons=kb_owner_banned_list(0))
+            return
+
+        if data.startswith("o:banned_list:"):
+            try:
+                page = int(data.split(":")[2])
+            except Exception:
+                page = 0
+            await safe_answer(event, f"📄 {page + 1}")
+            await safe_edit(event,
+                f"{STAR_LINE}\n🚫 **BANNED SESSIONS**\n{STAR_LINE}\n\n"
+                f"📊 Total: **{len(BANNED_SESSIONS)}**",
+                buttons=kb_owner_banned_list(page))
+            return
+
+        if data.startswith("o:banned_info:"):
+            sf = data[len("o:banned_info:"):]
+            await safe_answer(event, "🚫")
+            await safe_edit(event,
+                f"{STAR_LINE}\n🚫 **BANNED INFO**\n{STAR_LINE}\n\n"
+                f"📁 `{sf}`\n\n"
+                f"⚠️ Ye session blocked hai\n"
+                f"AuthKeyDuplicated / expired\n\n"
+                f"File already deleted from disk.",
+                buttons=[
+                    [btn("🧹 Remove from DB",
+                         data=f"o:banned_remove:{sf}".encode(),
+                         style="danger")],
+                    [btn("🔙 Back", data=b"o:banned_list",
+                         style="primary")]])
+            return
+
+        if data.startswith("o:banned_remove:"):
+            sf = data[len("o:banned_remove:"):]
+            BANNED_SESSIONS.discard(sf)
+            try:
+                conn = sqlite3.connect(DB_FILE)
+                try:
+                    conn.execute("DELETE FROM banned_sessions WHERE filename=?",
+                                 (sf,))
+                    conn.commit()
+                finally:
+                    conn.close()
+            except Exception:
+                pass
+            await safe_answer(event, "✅ Removed", alert=True)
+            await safe_edit(event,
+                f"{STAR_LINE}\n🚫 **BANNED SESSIONS**\n{STAR_LINE}\n\n"
+                f"📊 Total: **{len(BANNED_SESSIONS)}**",
+                buttons=kb_owner_banned_list(0))
+            return
+
+        if data == "o:banned_clear":
+            BANNED_SESSIONS.clear()
+            try:
+                conn = sqlite3.connect(DB_FILE)
+                try:
+                    conn.execute("DELETE FROM banned_sessions")
+                    conn.commit()
+                finally:
+                    conn.close()
+            except Exception:
+                pass
+            await safe_answer(event, "🧹 Cleared", alert=True)
+            await safe_edit(event,
+                f"📋 **Sessions List**",
+                buttons=kb_owner_sessions_list(0))
+            return
+
+        # ═════ SESSION INFO ═════
         if data.startswith("o:sess_info:"):
             sf = data[len("o:sess_info:"):]
             await safe_answer(event, "📁")
@@ -5211,7 +5628,8 @@ async def handle_owner_cb(event, uid, data):
                         buttons=kb_owner_session_info(sf))
                 else:
                     await safe_edit(event,
-                        f"❌ **Failed**\n\n`{sf}`",
+                        f"❌ **Failed**\n\n`{sf}`\n"
+                        f"(likely banned/expired)",
                         buttons=kb_owner_session_info(sf))
             except Exception as e:
                 await safe_edit(event,
@@ -5237,6 +5655,15 @@ async def handle_owner_cb(event, uid, data):
                     pass
             await safe_answer(event, "🔌", alert=True)
             await safe_edit(event, "✅ Disconnected",
+                buttons=kb_owner_session_info(sf))
+            return
+
+        if data.startswith("o:sess_ban_mark:"):
+            sf = data[len("o:sess_ban_mark:"):]
+            mark_session_banned(sf, "manual")
+            db_add_banned_session(sf, "manual")
+            await safe_answer(event, "🚫 Banned", alert=True)
+            await safe_edit(event, "🚫 Marked as banned",
                 buttons=kb_owner_session_info(sf))
             return
 
@@ -5591,16 +6018,19 @@ def _build_sessions_overview():
         f"📁 Total: **{status['total']}**\n"
         f"🟢 Available: **{status['available']}**\n"
         f"🌊 Flooded: **{status['flooded']}**\n"
+        f"🚫 Banned: **{status.get('banned', 0)}**\n"
         f"💾 Loaded: **{status['loaded']}**\n\n"
         f"{DIV()}\n"
         f"📊 Lifetime Usage: **{stats['total_used']}**\n\n"
-        f"🧹 Auto-cleanup: every 30 min"
+        f"🧹 Auto-cleanup: every 30 min\n"
+        f"🚫 AuthKeyDuplicated: auto-delete"
     )
 
 
 def _build_session_detail(sf):
     flooded = is_session_flooded(sf)
     loaded = sf in REAL_CLIENTS
+    banned = is_banned_session(sf)
     flood_until = REAL_FLOOD_UNTIL.get(sf)
 
     flood_txt = "—"
@@ -5613,6 +6043,7 @@ def _build_session_detail(sf):
         f"📁 **SESSION INFO**\n"
         f"{STAR_LINE}\n\n"
         f"📄 File: `{sf}`\n\n"
+        f"🚫 Banned: **{'✅' if banned else '❌'}**\n"
         f"🌊 Flooded: **{'✅' if flooded else '❌'}**\n"
         f"💾 Loaded: **{'✅' if loaded else '❌'}**\n"
         f"⏱️ Flood till: **{flood_txt}**"
@@ -5640,9 +6071,19 @@ async def _manual_check_now():
 # ══════════════════════ MANUAL CLEANUP ══════════════════════
 async def _manual_cleanup_sessions():
     try:
-        sessions = discover_sessions()
+        sessions = []
+        if os.path.isdir(SESSIONS_DIR):
+            try:
+                sessions = [
+                    f for f in os.listdir(SESSIONS_DIR)
+                    if f.endswith(".session") and f not in BANNED_SESSIONS
+                ]
+            except Exception:
+                sessions = []
+
         removed = 0
         kept = 0
+        banned_new = 0
 
         for sf in sessions:
             try:
@@ -5668,19 +6109,60 @@ async def _manual_cleanup_sessions():
                         except Exception:
                             pass
                         REAL_CLIENTS.pop(sf, None)
+                    BANNED_SESSIONS.add(sf)
+                    db_add_banned_session(sf, "not_authorized")
                     removed += 1
+                    banned_new += 1
                 else:
                     try:
                         await asyncio.wait_for(client.get_me(), timeout=8)
                         kept += 1
-                    except Exception:
                         await client.disconnect()
+                    except AuthKeyDuplicatedError:
+                        try:
+                            await client.disconnect()
+                        except Exception:
+                            pass
                         os.remove(session_file)
                         if sf in REAL_CLIENTS:
                             REAL_CLIENTS.pop(sf, None)
+                        BANNED_SESSIONS.add(sf)
+                        db_add_banned_session(sf, "authkey_duplicated")
                         removed += 1
+                        banned_new += 1
                         continue
-                    await client.disconnect()
+                    except Exception as e:
+                        err_str = str(e)
+                        if is_auth_error(err_str):
+                            try:
+                                await client.disconnect()
+                            except Exception:
+                                pass
+                            os.remove(session_file)
+                            if sf in REAL_CLIENTS:
+                                REAL_CLIENTS.pop(sf, None)
+                            BANNED_SESSIONS.add(sf)
+                            db_add_banned_session(sf, "auth_error")
+                            removed += 1
+                            banned_new += 1
+                            continue
+                        else:
+                            kept += 1
+                            try:
+                                await client.disconnect()
+                            except Exception:
+                                pass
+            except AuthKeyDuplicatedError:
+                try:
+                    os.remove(session_file)
+                except Exception:
+                    pass
+                if sf in REAL_CLIENTS:
+                    REAL_CLIENTS.pop(sf, None)
+                BANNED_SESSIONS.add(sf)
+                db_add_banned_session(sf, "authkey_duplicated")
+                removed += 1
+                banned_new += 1
             except Exception:
                 pass
 
@@ -5690,6 +6172,7 @@ async def _manual_cleanup_sessions():
                 f"🧹 **Manual Cleanup Done**\n"
                 f"{STAR_LINE}\n\n"
                 f"🗑️ Removed: **{removed}**\n"
+                f"🚫 New bans: **{banned_new}**\n"
                 f"✅ Kept: **{kept}**\n"
                 f"📊 Remaining: **{len(discover_sessions())}**")
         except Exception:
@@ -5718,6 +6201,7 @@ async def start_health_server():
                 "total": sessions["total"],
                 "available": sessions["available"],
                 "flooded": sessions["flooded"],
+                "banned": sessions.get("banned", 0),
                 "loaded": sessions["loaded"],
             },
             "reactions": {
@@ -5745,11 +6229,20 @@ def global_exception_handler(loop, context):
     if not exc:
         return
     err_name = type(exc).__name__
-    if err_name in ("QueryIdInvalidError",):
+
+    # ✅ Ignore common noise
+    if err_name in ("QueryIdInvalidError", "GeneratorExit",
+                    "OperationalError"):
         return
-    if "query ID is invalid" in str(exc):
+    err_str = str(exc)
+    if "query ID is invalid" in err_str:
         return
-    print(f"\n⚠️ GLOBAL: {err_name}: {str(exc)[:120]}", flush=True)
+    if "coroutine ignored GeneratorExit" in err_str:
+        return
+    if "database is locked" in err_str:
+        return
+
+    print(f"\n⚠️ GLOBAL: {err_name}: {err_str[:120]}", flush=True)
 
 
 # ══════════════════════ MAIN ══════════════════════
@@ -5766,14 +6259,14 @@ async def main():
     print("╔" + "═" * 58 + "╗", flush=True)
     print("║" + " " * 14 + "👻  GHOST AUTO-REACTOR" + " " * 21 + "║",
           flush=True)
-    print("║" + " " * 18 + "Whitelist Edition v4.0" + " " * 17 + "║",
+    print("║" + " " * 18 + "Whitelist Edition v5.0" + " " * 17 + "║",
           flush=True)
     print("╚" + "═" * 58 + "╝", flush=True)
     print("", flush=True)
 
     DBG("Initializing database...", "db")
     db_init()
-    DBG("Database ready", "ok")
+    DBG(f"Database ready (banned loaded: {len(BANNED_SESSIONS)})", "ok")
 
     DBG("Ensuring owner is whitelisted as user...", "db")
     try:
@@ -5822,6 +6315,9 @@ async def main():
         print(f"  ⚠️ Sessions dir empty: {SESSIONS_DIR}", flush=True)
     else:
         print(f"  ✅ Sessions loaded: {len(sessions)}", flush=True)
+
+    if len(BANNED_SESSIONS) > 0:
+        print(f"  🚫 Banned sessions: {len(BANNED_SESSIONS)}", flush=True)
 
     if HAS_GH_SYNC and github_sync.is_enabled():
         try:
